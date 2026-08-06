@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
-"""fi-65F WIA command-line capture utility for 64-bit Windows.
+"""fi-65FからWIA経由で画像を取り込むコマンドラインツール。
 
-Features
---------
-- Windows/WIA only; Linux and macOS are intentionally unsupported.
-- CLI options override config.ini.
-- Diagnostic mode enumerates all WIA properties and checks which target
-  settings are exposed, writable, and accepted by a no-change write probe.
-- JPEG files are saved as ./jpeg/DSC_0001.jpeg ... DSC_9999.jpeg.
+64-bit Windows専用で、CLIの値を ``config.ini`` より優先して使用する。
+診断モードではWIAプロパティの公開状況と書き込み可否を調査し、通常
+モードでは画像を ``DSC_####.jpeg`` という連番で保存する。
 
-Notes
------
-WIA brightness/contrast are driver properties. They are not guaranteed to be
-physical exposure time, integration time, or analog gain controls.
+WIAのbrightness/contrastはドライバーのプロパティであり、物理的な
+露光時間、積分時間、アナログゲインを直接制御する保証はない。
 """
 
 from __future__ import annotations
@@ -30,24 +24,19 @@ import sys
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 try:
     import pythoncom
     import win32com.client
-except ImportError as exc:  # pragma: no cover - Windows runtime dependency
-    raise SystemExit(
-        "pywin32 is required. Install it with:\n"
-        "  py -m pip install pywin32\n"
-    ) from exc
+except ImportError:  # pragma: no cover - Windows以外で純粋関数をテスト可能にする
+    pythoncom = None
+    win32com = None
 
 try:
     from PIL import Image
-except ImportError as exc:  # pragma: no cover - runtime dependency
-    raise SystemExit(
-        "Pillow is required. Install it with:\n"
-        "  py -m pip install Pillow\n"
-    ) from exc
+except ImportError:  # pragma: no cover - 実行時に分かりやすいエラーを表示する
+    Image = None
 
 
 # WIA constants used by the capture path.
@@ -126,6 +115,8 @@ DSC_PATTERN = re.compile(r"^DSC_(\d{4})\.jpeg$", re.IGNORECASE)
 
 @dataclass
 class PropertyReport:
+    """WIAプロパティ1件の診断結果を保持する。"""
+
     property_id: int
     name: str
     driver_name: str
@@ -141,6 +132,8 @@ class PropertyReport:
 
 @dataclass
 class TargetSupport:
+    """設定対象プロパティのサポート状況を保持する。"""
+
     setting: str
     property_id: int
     property_name: str
@@ -153,6 +146,7 @@ class TargetSupport:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """コマンドライン引数を定義したパーサーを生成する。"""
     parser = argparse.ArgumentParser(
         description="Capture one image from a WIA scanner and save DSC_####.jpeg."
     )
@@ -197,6 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def read_config(path: Path) -> configparser.ConfigParser:
+    """指定されたINIファイルを読み込む。存在しない場合は空の設定を返す。"""
     config = configparser.ConfigParser()
     if path.exists():
         config.read(path, encoding="utf-8")
@@ -212,6 +207,7 @@ def config_value(
     cast: Any = str,
     default: Any = None,
 ) -> Any:
+    """CLI、INI、既定値の優先順で設定値を解決する。"""
     cli_value = getattr(args, arg_name)
     if cli_value is not None:
         return cli_value
@@ -226,6 +222,7 @@ def config_value(
 
 
 def jsonable(value: Any) -> Any:
+    """COM由来の値をJSONへ直列化できる値に変換する。"""
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, bytes):
@@ -239,6 +236,7 @@ def jsonable(value: Any) -> Any:
 
 
 def property_value(properties: Any, key: Any) -> Any:
+    """WIAプロパティを取得し、取得できない場合は ``None`` を返す。"""
     try:
         return properties.Item(key).Value
     except Exception:
@@ -246,6 +244,7 @@ def property_value(properties: Any, key: Any) -> Any:
 
 
 def scanner_name(info: Any) -> str:
+    """デバイス情報から表示用のスキャナー名を取得する。"""
     for key in ("Name", 7):
         value = property_value(info.Properties, key)
         if value:
@@ -254,6 +253,7 @@ def scanner_name(info: Any) -> str:
 
 
 def scanner_infos() -> list[Any]:
+    """接続可能なWIAスキャナーのデバイス情報を列挙する。"""
     manager = win32com.client.Dispatch("WIA.DeviceManager")
     return [
         info
@@ -263,6 +263,7 @@ def scanner_infos() -> list[Any]:
 
 
 def list_devices() -> int:
+    """利用可能なWIAスキャナーを標準出力へ表示する。"""
     infos = scanner_infos()
     if not infos:
         print("No WIA scanner was found.", file=sys.stderr)
@@ -274,6 +275,7 @@ def list_devices() -> int:
 
 
 def select_device(name_substring: Optional[str]) -> tuple[Any, Any]:
+    """名前の部分一致でスキャナーを一意に選択して接続する。"""
     infos = scanner_infos()
     if not infos:
         raise RuntimeError("No WIA scanner was found.")
@@ -298,12 +300,14 @@ def select_device(name_substring: Optional[str]) -> tuple[Any, Any]:
 
 
 def get_scan_item(device: Any) -> Any:
+    """デバイスが公開する最初の転送対象を取得する。"""
     if device.Items.Count < 1:
         raise RuntimeError("The scanner exposes no transferable WIA item.")
     return device.Items.Item(1)
 
 
 def find_property(item: Any, property_id: int) -> Optional[Any]:
+    """指定IDのWIAプロパティを検索する。"""
     try:
         return item.Properties.Item(property_id)
     except Exception:
@@ -318,6 +322,7 @@ def find_property(item: Any, property_id: int) -> Optional[Any]:
 
 
 def safe_get(obj: Any, attribute: str, default: Any = None) -> Any:
+    """COM属性を安全に読み、失敗した場合は既定値を返す。"""
     try:
         return getattr(obj, attribute)
     except Exception:
@@ -325,6 +330,7 @@ def safe_get(obj: Any, attribute: str, default: Any = None) -> Any:
 
 
 def property_subtype_name(subtype: int) -> str:
+    """WIAプロパティのサブタイプを表示名へ変換する。"""
     return {
         WIA_PROP_NONE: "NONE",
         WIA_PROP_RANGE: "RANGE",
@@ -334,6 +340,7 @@ def property_subtype_name(subtype: int) -> str:
 
 
 def property_constraints(prop: Any) -> Any:
+    """WIAプロパティが公開する値の制約を辞書にまとめる。"""
     subtype = int(safe_get(prop, "SubType", WIA_PROP_NONE))
     if subtype == WIA_PROP_RANGE:
         return {
@@ -354,11 +361,13 @@ def property_constraints(prop: Any) -> Any:
 
 
 def is_read_only(prop: Any) -> Optional[bool]:
+    """プロパティの読み取り専用状態を取得する。"""
     value = safe_get(prop, "IsReadOnly", None)
     return None if value is None else bool(value)
 
 
 def read_property(prop: Any) -> Any:
+    """プロパティ値を読み、失敗時はエラー内容を文字列で返す。"""
     try:
         return prop.Value
     except Exception as exc:
@@ -366,6 +375,7 @@ def read_property(prop: Any) -> Any:
 
 
 def probe_property_write(prop: Any, enabled: bool) -> tuple[str, Optional[str]]:
+    """現在値を再設定し、プロパティの書き込み可否を調べる。"""
     read_only = is_read_only(prop)
     if read_only is True:
         return "READ_ONLY", None
@@ -388,6 +398,7 @@ def probe_property_write(prop: Any, enabled: bool) -> tuple[str, Optional[str]]:
 
 
 def inspect_property(prop: Any, probe_writes: bool) -> PropertyReport:
+    """WIAプロパティを調査して診断結果を生成する。"""
     property_id = int(safe_get(prop, "PropertyID", -1))
     driver_name = str(safe_get(prop, "Name", "Unknown"))
     subtype = int(safe_get(prop, "SubType", WIA_PROP_NONE))
@@ -410,6 +421,7 @@ def inspect_property(prop: Any, probe_writes: bool) -> PropertyReport:
 def support_from_property(
     setting: str, property_id: int, prop_report: Optional[PropertyReport]
 ) -> TargetSupport:
+    """診断結果から対象設定のサポート状況を判定する。"""
     if prop_report is None:
         return TargetSupport(
             setting=setting,
@@ -453,12 +465,15 @@ def write_diagnostic_report(
     output_dir: Path,
     probe_writes: bool,
 ) -> tuple[Path, Path]:
+    """全プロパティの診断結果をJSON形式とテキスト形式で保存する。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     json_path = output_dir / f"wia_diagnostic_{stamp}.json"
     text_path = output_dir / f"wia_diagnostic_{stamp}.txt"
 
-    property_reports = [inspect_property(prop, probe_writes) for prop in item.Properties]
+    property_reports = [
+        inspect_property(prop, probe_writes) for prop in item.Properties
+    ]
     property_reports.sort(key=lambda report: report.property_id)
     by_id = {report.property_id: report for report in property_reports}
     targets = [
@@ -509,7 +524,13 @@ def write_diagnostic_report(
         if target.detail:
             lines.append(f"  detail : {target.detail}")
 
-    lines.extend(["", "All properties exposed by the selected WIA item", "-----------------------------------------------"])
+    lines.extend(
+        [
+            "",
+            "All properties exposed by the selected WIA item",
+            "-----------------------------------------------",
+        ]
+    )
     for prop in property_reports:
         lines.append(
             f"{prop.property_id:5d} {prop.name} "
@@ -526,6 +547,7 @@ def write_diagnostic_report(
 
 
 def normalize_property_value(prop: Any, requested: int) -> int:
+    """要求値をプロパティの範囲や候補値に合わせて正規化する。"""
     subtype = int(safe_get(prop, "SubType", WIA_PROP_NONE))
     if subtype == WIA_PROP_RANGE:
         minimum = int(prop.SubTypeMin)
@@ -548,6 +570,7 @@ def set_property(
     requested: Optional[int],
     strict: bool,
 ) -> None:
+    """WIAプロパティへ正規化済みの要求値を設定する。"""
     if requested is None:
         return
 
@@ -581,6 +604,7 @@ def set_property(
 
 
 def mode_to_intent(mode: str) -> int:
+    """画像モードをWIAの取り込み用途フラグへ変換する。"""
     image_type = {
         "color": WIA_INTENT_IMAGE_TYPE_COLOR,
         "grayscale": WIA_INTENT_IMAGE_TYPE_GRAYSCALE,
@@ -589,17 +613,31 @@ def mode_to_intent(mode: str) -> int:
     return image_type | WIA_INTENT_MAXIMIZE_QUALITY
 
 
-def reserve_output_path(output_dir: Path) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    highest = 0
-    for entry in output_dir.iterdir():
-        if not entry.is_file():
-            continue
-        match = DSC_PATTERN.match(entry.name)
-        if match:
-            highest = max(highest, int(match.group(1)))
+def next_output_number(names: list[str]) -> int:
+    """既存ファイル名から次に使用する連番を求める。
 
-    for number in range(highest + 1, 10000):
+    対象外のファイル名は無視する。最大番号が9999に達している場合は、
+    新しい名前を割り当てられないため ``RuntimeError`` を送出する。
+    """
+    numbers = [
+        int(match.group(1))
+        for name in names
+        if (match := DSC_PATTERN.match(name)) is not None
+    ]
+    next_number = max(numbers, default=0) + 1
+    if next_number > 9999:
+        raise RuntimeError("DSC_9999.jpeg already exists; no filename remains.")
+    return next_number
+
+
+def reserve_output_path(output_dir: Path) -> Path:
+    """未使用の連番ファイルを排他的に作成して予約する。"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    file_names = [entry.name for entry in output_dir.iterdir() if entry.is_file()]
+    first_number = next_output_number(file_names)
+
+    # 同時実行で候補が先に作成されても、次の番号を試して衝突を避ける。
+    for number in range(first_number, 10000):
         candidate = output_dir / f"DSC_{number:04d}.jpeg"
         try:
             descriptor = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -610,12 +648,29 @@ def reserve_output_path(output_dir: Path) -> Path:
     raise RuntimeError("DSC_9999.jpeg already exists; no filename remains.")
 
 
+def remove_empty_reservation(output: Optional[Path]) -> None:
+    """取り込み失敗時に空の予約ファイルだけを削除する。"""
+    if output is None:
+        return
+    try:
+        if output.exists() and output.stat().st_size == 0:
+            output.unlink()
+    except OSError:
+        logging.warning("Could not remove empty reserved file: %s", output)
+
+
+def runtime_dependencies_available() -> bool:
+    """画像取り込みに必要なWindows向け依存関係が利用可能か確認する。"""
+    return pythoncom is not None and win32com is not None and Image is not None
+
+
 def save_transfer_as_jpeg(
     image_file: Any,
     output: Path,
     quality: int,
     mode: str,
 ) -> None:
+    """WIAの転送画像を指定モードのJPEGとして保存する。"""
     with tempfile.TemporaryDirectory(prefix="fi65f_") as temp_dir:
         bmp_path = Path(temp_dir) / "capture.bmp"
         image_file.SaveFile(str(bmp_path))
@@ -639,6 +694,7 @@ def save_transfer_as_jpeg(
 
 
 def main() -> int:
+    """引数と設定を読み込み、診断または画像取り込みを実行する。"""
     args = build_parser().parse_args()
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -651,6 +707,11 @@ def main() -> int:
     if struct.calcsize("P") * 8 != 64:
         logging.error("A 64-bit Python installation is required.")
         return 2
+    if not runtime_dependencies_available():
+        logging.error(
+            "pywin32 and Pillow are required. Run: py -m pip install -r requirements.txt"
+        )
+        return 2
 
     config = read_config(Path(args.config))
     if args.list_devices:
@@ -662,7 +723,13 @@ def main() -> int:
     )
     diagnostic_dir = Path(
         config_value(
-            args, config, "diagnostic_dir", "diagnostics", "directory", str, "./diagnostics"
+            args,
+            config,
+            "diagnostic_dir",
+            "diagnostics",
+            "directory",
+            str,
+            "./diagnostics",
         )
     )
     dpi = config_value(args, config, "dpi", "scan", "dpi", int, 600)
@@ -738,12 +805,7 @@ def main() -> int:
         return 0
 
     except Exception as exc:
-        if reserved_output is not None:
-            try:
-                if reserved_output.exists() and reserved_output.stat().st_size == 0:
-                    reserved_output.unlink()
-            except OSError:
-                pass
+        remove_empty_reservation(reserved_output)
         logging.error("%s", exc)
         if args.verbose:
             logging.exception("Detailed failure")
