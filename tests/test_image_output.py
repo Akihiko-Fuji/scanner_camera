@@ -48,8 +48,11 @@ def test_save_transfer_as_jpeg_clamps_quality(
 def test_save_transfer_as_jpeg_applies_bw_threshold(
     tmp_path: Path, fake_image_file_cls
 ) -> None:
-    source = Image.new("L", (2, 1))
-    source.putdata([64, 192])
+    # WIA normally supplies a bitmap image. Use RGB input here so the test
+    # exercises the production conversion path without retaining an L-mode
+    # BMP file handle on Windows/Pillow during TemporaryDirectory cleanup.
+    source = Image.new("RGB", (2, 1))
+    source.putdata([(64, 64, 64), (192, 192, 192)])
     output = tmp_path / "bw.jpeg"
 
     target.save_transfer_as_jpeg(
