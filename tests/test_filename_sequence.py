@@ -1,60 +1,105 @@
-"""連番ファイル名の割り当て処理を検証するテスト。"""
+from __future__ import annotations
 
-import tempfile
-import unittest
 from pathlib import Path
 
-from scanner_capture import (
-    next_output_number,
-    remove_empty_reservation,
-    reserve_output_path,
+import pytest
+
+import scanner_capture as target
+
+
+def test_next_output_number_starts_at_one() -> None:
+    assert target.next_output_number([]) == 1
+
+
+@pytest.mark.parametrize(
+    ("names", "expected"),
+    [
+        (["DSC_0001.jpeg"], 2),
+        (["DSC_0001.jpeg", "DSC_0009.jpeg", "DSC_0003.jpeg"], 10),
+        (["dsc_0042.JPEG"], 43),
+        (["notes.txt", "DSC_12.jpeg", "DSC_0002.jpg"], 1),
+        (["DSC_0002.jpeg", "DSC_0004.jpeg"], 5),
+    ],
 )
+def test_next_output_number_uses_highest_valid_sequence(
+    names: list[str], expected: int
+) -> None:
+    assert target.next_output_number(names) == expected
 
 
-class NextOutputNumberTests(unittest.TestCase):
-    """既存の名前から次の連番を求める純粋関数を検証する。"""
-
-    def test_returns_one_when_no_capture_exists(self) -> None:
-        """対象となるファイルがなければ1を返す。"""
-        self.assertEqual(next_output_number(["memo.txt", "DSC_123.jpeg"]), 1)
-
-    def test_uses_highest_number_case_insensitively(self) -> None:
-        """大文字小文字を区別せず、最大番号の次を返す。"""
-        names = ["DSC_0002.jpeg", "dsc_0010.JPEG", "DSC_0007.jpeg"]
-        self.assertEqual(next_output_number(names), 11)
-
-    def test_raises_when_sequence_is_exhausted(self) -> None:
-        """9999まで使用済みなら明示的なエラーにする。"""
-        with self.assertRaisesRegex(RuntimeError, "DSC_9999"):
-            next_output_number(["DSC_9999.jpeg"])
+def test_next_output_number_rejects_exhausted_sequence() -> None:
+    with pytest.raises(RuntimeError, match="DSC_9999"):
+        target.next_output_number(["DSC_9999.jpeg"])
 
 
-class OutputReservationTests(unittest.TestCase):
-    """連番パスの予約と失敗時の後始末を検証する。"""
+def test_reserve_output_path_creates_directory_and_empty_file(tmp_path: Path) -> None:
+    output_dir = tmp_path / "jpeg"
 
-    def test_reserves_next_path_and_cleanup_removes_empty_file(self) -> None:
-        """次のパスを空ファイルで予約し、後始末で削除する。"""
-        with tempfile.TemporaryDirectory() as directory:
-            output_dir = Path(directory)
-            (output_dir / "DSC_0003.jpeg").write_bytes(b"image")
+    result = target.reserve_output_path(output_dir)
 
-            reserved = reserve_output_path(output_dir)
-
-            self.assertEqual(reserved.name, "DSC_0004.jpeg")
-            self.assertTrue(reserved.exists())
-            remove_empty_reservation(reserved)
-            self.assertFalse(reserved.exists())
-
-    def test_cleanup_preserves_non_empty_file(self) -> None:
-        """保存済みの画像は後始末の対象にしない。"""
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "DSC_0001.jpeg"
-            output.write_bytes(b"image")
-
-            remove_empty_reservation(output)
-
-            self.assertTrue(output.exists())
+    assert result == output_dir / "DSC_0001.jpeg"
+    assert result.exists()
+    assert result.stat().st_size == 0
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_reserve_output_path_uses_next_number(tmp_path: Path) -> None:
+    output_dir = tmp_path / "jpeg"
+    output_dir.mkdir()
+    (output_dir / "DSC_0001.jpeg").write_bytes(b"one")
+    (output_dir / "DSC_0007.jpeg").write_bytes(b"seven")
+    (output_dir / "unrelated.jpeg").write_bytes(b"ignored")
+
+    result = target.reserve_output_path(output_dir)
+
+    assert result.name == "DSC_0008.jpeg"
+
+
+def test_reserve_output_path_retries_after_concurrent_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output_dir = tmp_path / "jpeg"
+    original_open = target.os.open
+    attempted: list[str] = []
+
+    def racing_open(path, flags, *args, **kwargs):
+        attempted.append(Path(path).name)
+        if Path(path).name == "DSC_0001.jpeg":
+            raise FileExistsError(path)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(target.os, "open", racing_open)
+
+    result = target.reserve_output_path(output_dir)
+
+    assert attempted[:2] == ["DSC_0001.jpeg", "DSC_0002.jpeg"]
+    assert result.name == "DSC_0002.jpeg"
+
+
+def test_remove_empty_reservation_deletes_only_empty_file(tmp_path: Path) -> None:
+    empty = tmp_path / "empty.jpeg"
+    nonempty = tmp_path / "nonempty.jpeg"
+    empty.touch()
+    nonempty.write_bytes(b"image")
+
+    target.remove_empty_reservation(empty)
+    target.remove_empty_reservation(nonempty)
+    target.remove_empty_reservation(None)
+
+    assert not empty.exists()
+    assert nonempty.read_bytes() == b"image"
+
+
+def test_remove_empty_reservation_logs_unlink_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    reserved = tmp_path / "reserved.jpeg"
+    reserved.touch()
+
+    def fail_unlink(self):
+        raise OSError("locked")
+
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+
+    target.remove_empty_reservation(reserved)
+
+    assert "Could not remove empty reserved file" in caplog.text
