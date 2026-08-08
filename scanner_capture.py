@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """fi-65FからWIA経由で画像を取り込むコマンドラインツール。
 
-64-bit Windows専用で、CLIの値を ``config.ini`` より優先して使用する。
+Windows 32-bit / 64-bitを対象とし、CLIの値を ``config.ini`` より優先して使用する。
 診断モードではWIAプロパティの公開状況と書き込み可否を調査し、通常
 モードでは画像を ``DSC_####.jpeg`` という連番で保存する。
 
@@ -702,10 +702,7 @@ def main() -> int:
     )
 
     if os.name != "nt":
-        logging.error("This utility supports 64-bit Windows only.")
-        return 2
-    if struct.calcsize("P") * 8 != 64:
-        logging.error("A 64-bit Python installation is required.")
+        logging.error("This utility supports Windows only.")
         return 2
     if not runtime_dependencies_available():
         logging.error(

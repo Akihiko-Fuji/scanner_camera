@@ -31,13 +31,11 @@ class FakeDialog:
         return self.image_file
 
 
-def prepare_windows_runtime(monkeypatch):
+def prepare_windows_runtime(monkeypatch, pointer_size=8):
     fake_pythoncom = FakePythonCom()
-    # pathlib.Path selects its concrete class from os.name at construction time.
-    # Freeze the host concrete class before simulating Windows on non-Windows CI.
     monkeypatch.setattr(target, "Path", type(Path()))
     monkeypatch.setattr(target.os, "name", "nt")
-    monkeypatch.setattr(target.struct, "calcsize", lambda _: 8)
+    monkeypatch.setattr(target.struct, "calcsize", lambda _: pointer_size)
     monkeypatch.setattr(target, "runtime_dependencies_available", lambda: True)
     monkeypatch.setattr(target, "pythoncom", fake_pythoncom)
     return fake_pythoncom
@@ -49,11 +47,11 @@ def test_main_rejects_non_windows(monkeypatch) -> None:
     assert target.main() == 2
 
 
-def test_main_rejects_32_bit_python(monkeypatch) -> None:
-    monkeypatch.setattr(target.os, "name", "nt")
-    monkeypatch.setattr(target.struct, "calcsize", lambda _: 4)
-    monkeypatch.setattr(sys, "argv", ["scanner_capture.py"])
-    assert target.main() == 2
+def test_main_accepts_32_bit_windows_runtime(monkeypatch) -> None:
+    prepare_windows_runtime(monkeypatch, pointer_size=4)
+    monkeypatch.setattr(target, "list_devices", lambda: 0)
+    monkeypatch.setattr(sys, "argv", ["scanner_capture.py", "--list-devices"])
+    assert target.main() == 0
 
 
 def test_main_rejects_missing_runtime_dependencies(monkeypatch) -> None:
@@ -64,27 +62,14 @@ def test_main_rejects_missing_runtime_dependencies(monkeypatch) -> None:
     assert target.main() == 2
 
 
-def test_main_diagnostic_flow(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
-) -> None:
+def test_main_diagnostic_flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     fake_pythoncom = prepare_windows_runtime(monkeypatch)
     info, device, item = object(), object(), object()
     monkeypatch.setattr(target, "select_device", lambda name: (info, device))
     monkeypatch.setattr(target, "get_scan_item", lambda selected: item)
     outputs = (tmp_path / "report.json", tmp_path / "report.txt")
     monkeypatch.setattr(target, "write_diagnostic_report", lambda *args: outputs)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "scanner_capture.py",
-            "--diagnose",
-            "--device",
-            "fi-65F",
-            "--diagnostic-dir",
-            str(tmp_path),
-        ],
-    )
+    monkeypatch.setattr(sys, "argv", ["scanner_capture.py", "--diagnose", "--device", "fi-65F", "--diagnostic-dir", str(tmp_path)])
 
     result = target.main()
 
@@ -96,9 +81,7 @@ def test_main_diagnostic_flow(
     assert "report.txt" in output
 
 
-def test_main_capture_flow_reserves_and_saves_sequential_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_main_capture_flow_reserves_and_saves_sequential_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     fake_pythoncom = prepare_windows_runtime(monkeypatch)
     info, device, item = object(), object(), object()
     image_file = object()
@@ -108,48 +91,13 @@ def test_main_capture_flow_reserves_and_saves_sequential_file(
 
     monkeypatch.setattr(target, "select_device", lambda name: (info, device))
     monkeypatch.setattr(target, "get_scan_item", lambda selected: item)
-    monkeypatch.setattr(
-        target,
-        "set_property",
-        lambda selected, property_id, requested, strict: set_calls.append(
-            (property_id, requested, strict)
-        ),
-    )
-    monkeypatch.setattr(
-        target,
-        "save_transfer_as_jpeg",
-        lambda transferred, output, quality, mode: (
-            output.write_bytes(b"jpeg"),
-            save_calls.append((transferred, output, quality, mode)),
-        ),
-    )
-    monkeypatch.setattr(
-        target,
-        "win32com",
-        SimpleNamespace(client=SimpleNamespace(Dispatch=lambda name: dialog)),
-    )
+    monkeypatch.setattr(target, "set_property", lambda selected, property_id, requested, strict: set_calls.append((property_id, requested, strict)))
+    monkeypatch.setattr(target, "save_transfer_as_jpeg", lambda transferred, output, quality, mode: (output.write_bytes(b"jpeg"), save_calls.append((transferred, output, quality, mode))))
+    monkeypatch.setattr(target, "win32com", SimpleNamespace(client=SimpleNamespace(Dispatch=lambda name: dialog)))
     output_dir = tmp_path / "jpeg"
     output_dir.mkdir()
     (output_dir / "DSC_0003.jpeg").write_bytes(b"old")
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "scanner_capture.py",
-            "--device",
-            "fi-65F",
-            "--output-dir",
-            str(output_dir),
-            "--dpi",
-            "600",
-            "--mode",
-            "color",
-            "--brightness",
-            "100",
-            "--contrast",
-            "0",
-        ],
-    )
+    monkeypatch.setattr(sys, "argv", ["scanner_capture.py", "--device", "fi-65F", "--output-dir", str(output_dir), "--dpi", "600", "--mode", "color", "--brightness", "100", "--contrast", "0"])
 
     result = target.main()
 
@@ -162,26 +110,16 @@ def test_main_capture_flow_reserves_and_saves_sequential_file(
     assert dialog.calls == [(item, target.WIA_FORMAT_BMP, False)]
 
 
-def test_main_removes_empty_reservation_on_transfer_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_main_removes_empty_reservation_on_transfer_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     prepare_windows_runtime(monkeypatch)
     item = object()
     dialog = FakeDialog(None)
     monkeypatch.setattr(target, "select_device", lambda name: (object(), object()))
     monkeypatch.setattr(target, "get_scan_item", lambda selected: item)
     monkeypatch.setattr(target, "set_property", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        target,
-        "win32com",
-        SimpleNamespace(client=SimpleNamespace(Dispatch=lambda name: dialog)),
-    )
+    monkeypatch.setattr(target, "win32com", SimpleNamespace(client=SimpleNamespace(Dispatch=lambda name: dialog)))
     output_dir = tmp_path / "jpeg"
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["scanner_capture.py", "--output-dir", str(output_dir)],
-    )
+    monkeypatch.setattr(sys, "argv", ["scanner_capture.py", "--output-dir", str(output_dir)])
 
     result = target.main()
 

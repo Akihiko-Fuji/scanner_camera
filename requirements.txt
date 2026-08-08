@@ -1,2 +1,8 @@
-pywin32
-Pillow
+# Windows 8 (32-bit) target uses Python 3.8.x.  Keep package versions that still
+# publish CPython 3.8 / win32 wheels, while allowing newer Python on development
+# machines.
+pywin32==308; python_version < "3.9"
+pywin32>=308; python_version >= "3.9"
+Pillow>=10.0,<11.0; python_version < "3.9"
+Pillow>=11.0,<13.0; python_version >= "3.9"
+pytwain>=2.3.0,<3.0
