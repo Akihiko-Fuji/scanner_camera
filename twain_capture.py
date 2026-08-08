@@ -16,9 +16,11 @@ import argparse
 import datetime as dt
 import json
 import logging
+import math
 import os
 import platform
 import struct
+import sys
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -266,6 +268,33 @@ def current_scalar(payload: Any) -> Any:
     if isinstance(payload, list):
         return payload[0] if len(payload) == 1 else None
     return payload
+
+
+def _values_equivalent(requested: Any, readback: Any, item_type: Optional[int]) -> bool:
+    """SET要求値とGETCURRENT値が同一設定とみなせるか判定する。
+
+    TW_FIX32は16.16固定小数点への丸めがあり得るため、1 LSB程度の差は
+    同値として扱う。それ以外の数値・列挙値・真偽値は原則として一致を要求する。
+    """
+    if requested is None or readback is None:
+        return requested is readback
+
+    fix32 = _const("TWTY_FIX32")
+    if item_type == fix32:
+        try:
+            return math.isclose(
+                float(requested),
+                float(readback),
+                rel_tol=0.0,
+                abs_tol=(1.0 / 65536.0) + 1e-12,
+            )
+        except (TypeError, ValueError):
+            return requested == readback
+
+    if isinstance(requested, bool) or isinstance(readback, bool):
+        return bool(requested) == bool(readback)
+
+    return requested == readback
 
 
 def _bool_value(text: Optional[str]) -> Optional[bool]:
@@ -707,12 +736,22 @@ def set_capability(
             source, cap_id, "get_capability_current"
         )
         if read_ok:
-            logging.info(
-                "%s requested=%r readback=%r",
-                capability_name,
-                requested,
-                jsonable(current_scalar(read_payload)),
-            )
+            readback = current_scalar(read_payload)
+            if not _values_equivalent(requested, readback, item_type):
+                message = (
+                    f"{capability_name} requested={requested!r} but source "
+                    f"read back {jsonable(readback)!r}."
+                )
+                if strict:
+                    raise RuntimeError(message)
+                logging.warning(message)
+            else:
+                logging.info(
+                    "%s requested=%r readback=%r",
+                    capability_name,
+                    requested,
+                    jsonable(readback),
+                )
         else:
             logging.info(
                 "%s requested=%r (readback failed: %s)",
@@ -823,8 +862,12 @@ def save_twain_image_as_jpeg(
         image_object.save(str(bmp_path))
         with Image.open(bmp_path) as source:
             source.load()
-            if mode in {"grayscale", "bw"}:
+            if mode == "grayscale":
                 converted = source.convert("L")
+            elif mode == "bw":
+                converted = source.convert("L").point(
+                    lambda pixel: 255 if pixel >= 128 else 0, "1"
+                )
             else:
                 converted = source.convert("RGB")
             converted.save(
