@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """fi-65FをTWAIN経由で診断・制御して画像を取り込むCLI。
 
-Windows 64-bit + 64-bit TWAIN DSM/Data Sourceを対象とする。CLIの値を
-``config.ini`` より優先して使用し、WIA版 ``scanner_capture.py`` と同じ
-``DSC_####.jpeg`` の連番保存契約を共有する。
+Windows 32-bit / 64-bitを対象とし、Pythonプロセス、TWAIN DSM、Data Sourceの
+bitnessを一致させて使用する。CLIの値を ``config.ini`` より優先して使用し、
+WIA版 ``scanner_capture.py`` と同じ ``DSC_####.jpeg`` の連番保存契約を共有する。
 
 TWAINではWIAより多くのCapabilityが公開される可能性があるため、診断時は
 CAP_SUPPORTEDCAPSを起点に全Capabilityを読み出し、scanner_cameraで重要な
@@ -75,6 +75,11 @@ class TwainTargetSupport:
     allowed: Any
     support: str
     detail: Optional[str]
+
+
+def runtime_bitness() -> int:
+    """実行中Pythonプロセスのbitnessを返す。"""
+    return struct.calcsize("P") * 8
 
 
 def _const(name: str) -> Optional[int]:
@@ -181,7 +186,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not perform no-change write/read-back probes",
     )
     parser.add_argument("--device", help="Substring of TWAIN source name")
-    parser.add_argument("--dsm", help="Path/name of 64-bit TWAINDSM.dll")
+    parser.add_argument(
+        "--dsm",
+        help="Path/name of TWAINDSM.dll matching the Python process bitness",
+    )
     parser.add_argument("--dpi", type=float, help="Horizontal and vertical DPI")
     parser.add_argument("--brightness", type=float, help="TWAIN brightness value")
     parser.add_argument("--contrast", type=float, help="TWAIN contrast value")
@@ -304,7 +312,7 @@ def _bool_value(text: Optional[str]) -> Optional[bool]:
 
 
 def create_source_manager(dsm_name: Optional[str]) -> Any:
-    """64-bit TWAIN Source Managerを開く。"""
+    """実行中Pythonと同じbitnessのTWAIN Source Managerを開く。"""
     if twain is None:
         raise RuntimeError("pytwain is not installed")
     kwargs = {
@@ -327,8 +335,10 @@ def select_source(manager: Any, name_substring: Optional[str]) -> Any:
     """名前の部分一致でTWAIN Sourceを一意に選択して開く。"""
     names = source_names(manager)
     if not names:
+        bitness = runtime_bitness()
         raise RuntimeError(
-            "No 64-bit TWAIN source was found. Confirm TWAINDSM.dll and the 64-bit driver."
+            f"No {bitness}-bit TWAIN source was found. Confirm that Python, "
+            f"TWAINDSM.dll, and the scanner Data Source are all {bitness}-bit."
         )
     if name_substring:
         needle = name_substring.casefold()
@@ -355,7 +365,10 @@ def list_devices(dsm_name: Optional[str]) -> int:
     try:
         names = source_names(manager)
         if not names:
-            print("No 64-bit TWAIN source was found.", file=sys.stderr)
+            print(
+                f"No {runtime_bitness()}-bit TWAIN source was found.",
+                file=sys.stderr,
+            )
             return 1
         for index, name in enumerate(names, start=1):
             print(f"[{index}] {name}")
@@ -618,7 +631,7 @@ def write_diagnostic_report(
         "environment": {
             "platform": platform.platform(),
             "python_version": platform.python_version(),
-            "python_bitness": struct.calcsize("P") * 8,
+            "python_bitness": runtime_bitness(),
             "pytwain_version": pytwain_version,
             "dsm_name": dsm_name or "auto:twaindsm.dll",
             "probe_writes": probe_writes,
@@ -923,10 +936,7 @@ def main() -> int:
     )
 
     if os.name != "nt":
-        logging.error("This utility supports 64-bit Windows only.")
-        return 2
-    if struct.calcsize("P") * 8 != 64:
-        logging.error("A 64-bit Python installation is required for this TWAIN path.")
+        logging.error("This utility supports Windows only.")
         return 2
     if not runtime_dependencies_available():
         logging.error(
