@@ -112,12 +112,21 @@ def minimal_capture_caps():
     }
 
 
-def prepare_windows_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+def prepare_windows_runtime(
+    monkeypatch: pytest.MonkeyPatch, pointer_size: int = 8
+) -> None:
     # os.nameを変更するとpathlib.Pathの具象クラス選択も変わるため、先に固定する。
     monkeypatch.setattr(target, "Path", type(Path()))
     monkeypatch.setattr(target.os, "name", "nt")
-    monkeypatch.setattr(target.struct, "calcsize", lambda _: 8)
+    monkeypatch.setattr(target.struct, "calcsize", lambda _: pointer_size)
     monkeypatch.setattr(target, "runtime_dependencies_available", lambda: True)
+
+
+def test_runtime_bitness_uses_pointer_size(monkeypatch):
+    monkeypatch.setattr(target.struct, "calcsize", lambda _: 4)
+    assert target.runtime_bitness() == 32
+    monkeypatch.setattr(target.struct, "calcsize", lambda _: 8)
+    assert target.runtime_bitness() == 64
 
 
 @pytest.mark.parametrize(
@@ -206,7 +215,7 @@ def test_select_source_uses_first_source_when_name_is_omitted():
 def test_select_source_rejects_no_source_and_missing_match():
     empty = FakeManager([])
     empty.source_list = []
-    with pytest.raises(RuntimeError, match="No 64-bit TWAIN source"):
+    with pytest.raises(RuntimeError, match=r"No (32|64)-bit TWAIN source"):
         target.select_source(empty, None)
 
     manager = FakeManager(["A", "B"])
@@ -542,11 +551,11 @@ def test_main_rejects_non_windows(monkeypatch):
     assert target.main() == 2
 
 
-def test_main_rejects_32_bit_python(monkeypatch):
-    monkeypatch.setattr(target.os, "name", "nt")
-    monkeypatch.setattr(target.struct, "calcsize", lambda _: 4)
-    monkeypatch.setattr(sys, "argv", ["twain_capture.py"])
-    assert target.main() == 2
+def test_main_accepts_32_bit_windows_runtime(monkeypatch):
+    prepare_windows_runtime(monkeypatch, pointer_size=4)
+    monkeypatch.setattr(target, "list_devices", lambda dsm: 0)
+    monkeypatch.setattr(sys, "argv", ["twain_capture.py", "--list-devices"])
+    assert target.main() == 0
 
 
 def test_main_rejects_missing_dependencies(monkeypatch):
