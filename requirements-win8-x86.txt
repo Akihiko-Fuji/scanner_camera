@@ -1,0 +1,5 @@
+# Reproducible runtime set for the final Windows 8 32-bit target.
+# These versions are exercised by the Python 3.8 x86 CI lane.
+pywin32==308
+Pillow==10.4.0
+pytwain==2.3.0
