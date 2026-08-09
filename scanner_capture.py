@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import datetime as dt
+import gc
 import json
 import logging
 import os
@@ -158,9 +159,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Inspect WIA properties and save a support report",
     )
     parser.add_argument(
+        "--probe-writes",
+        action="store_true",
+        help="Explicitly enable no-change write/read-back diagnostic probes",
+    )
+    parser.add_argument(
         "--no-probe-writes",
         action="store_true",
-        help="Do not test writable properties by writing their current value",
+        help="Disable no-change write/read-back diagnostic probes",
     )
     parser.add_argument("--device", help="Substring of WIA scanner device name")
     parser.add_argument("--dpi", type=int, help="Horizontal and vertical DPI")
@@ -219,6 +225,21 @@ def config_value(
     if cast is bool:
         return config.getboolean(section, key)
     return cast(raw)
+
+
+def resolve_probe_writes(
+    args: argparse.Namespace, config: configparser.ConfigParser
+) -> bool:
+    """診断書き込みprobeを安全側の既定値で解決する。"""
+    if getattr(args, "probe_writes", False) and getattr(args, "no_probe_writes", False):
+        raise ValueError("--probe-writes and --no-probe-writes cannot be used together")
+    if getattr(args, "probe_writes", False):
+        return True
+    if getattr(args, "no_probe_writes", False):
+        return False
+    if config.has_option("diagnostics", "probe_writes"):
+        return config.getboolean("diagnostics", "probe_writes")
+    return False
 
 
 def jsonable(value: Any) -> Any:
@@ -595,12 +616,23 @@ def set_property(
         prop.Value = actual
         readback = prop.Value
     except Exception as exc:
-        raise RuntimeError(
+        message = (
             f"Could not set {label} to {actual}; allowed={property_constraints(prop)!r}"
-        ) from exc
-    logging.info(
-        "%s requested=%s applied=%s readback=%r", label, requested, actual, readback
-    )
+        )
+        if strict:
+            raise RuntimeError(message) from exc
+        logging.warning("%s: %s", message, exc)
+        return
+
+    if readback != actual:
+        message = f"{label} applied={actual!r} but read back {readback!r}."
+        if strict:
+            raise RuntimeError(message)
+        logging.warning(message)
+    else:
+        logging.info(
+            "%s requested=%s applied=%s readback=%r", label, requested, actual, readback
+        )
 
 
 def mode_to_intent(mode: str) -> int:
@@ -664,13 +696,48 @@ def runtime_dependencies_available() -> bool:
     return pythoncom is not None and win32com is not None and Image is not None
 
 
+def save_pillow_jpeg_atomically(
+    image: Any,
+    output: Path,
+    quality: int,
+    dpi: Optional[tuple[float, float]] = None,
+) -> None:
+    """JPEGを同一ディレクトリの一時ファイルへ完成させてから置換する。"""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{output.name}.", suffix=".tmp", dir=str(output.parent)
+    )
+    os.close(descriptor)
+    temp_path = Path(temp_name)
+    try:
+        kwargs = {
+            "format": "JPEG",
+            "quality": max(1, min(100, int(quality))),
+            "subsampling": 0,
+            "optimize": True,
+        }
+        if dpi is not None:
+            kwargs["dpi"] = (float(dpi[0]), float(dpi[1]))
+        image.save(temp_path, **kwargs)
+        # File data is complete before the reserved final path is replaced.
+        with temp_path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(str(temp_path), str(output))
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            logging.warning("Could not remove temporary JPEG file: %s", temp_path)
+
+
 def save_transfer_as_jpeg(
     image_file: Any,
     output: Path,
     quality: int,
     mode: str,
 ) -> None:
-    """WIAの転送画像を指定モードのJPEGとして保存する。"""
+    """WIAの転送画像を指定モードのJPEGとして原子的に保存する。"""
     with tempfile.TemporaryDirectory(prefix="fi65f_") as temp_dir:
         bmp_path = Path(temp_dir) / "capture.bmp"
         image_file.SaveFile(str(bmp_path))
@@ -684,89 +751,75 @@ def save_transfer_as_jpeg(
                 )
             else:
                 converted = image.convert("RGB")
-            converted.save(
-                output,
-                format="JPEG",
-                quality=max(1, min(100, quality)),
-                subsampling=0,
-                optimize=True,
-            )
+            try:
+                save_pillow_jpeg_atomically(converted, output, quality)
+            finally:
+                if converted is not image:
+                    converted.close()
 
 
-def main() -> int:
-    """引数と設定を読み込み、診断または画像取り込みを実行する。"""
-    args = build_parser().parse_args()
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(levelname)s: %(message)s",
-    )
-
-    if os.name != "nt":
-        logging.error("This utility supports Windows only.")
-        return 2
-    if not runtime_dependencies_available():
-        logging.error(
-            "pywin32 and Pillow are required. Run: py -m pip install -r requirements.txt"
-        )
-        return 2
-
-    config = read_config(Path(args.config))
-    if args.list_devices:
-        return list_devices()
-
-    device_name = config_value(args, config, "device", "scanner", "device", str, None)
-    output_dir = Path(
-        config_value(args, config, "output_dir", "output", "directory", str, "./jpeg")
-    )
-    diagnostic_dir = Path(
-        config_value(
-            args,
-            config,
-            "diagnostic_dir",
-            "diagnostics",
-            "directory",
-            str,
-            "./diagnostics",
-        )
-    )
-    dpi = config_value(args, config, "dpi", "scan", "dpi", int, 600)
-    brightness = config_value(
-        args, config, "brightness", "scan", "brightness", int, None
-    )
-    contrast = config_value(args, config, "contrast", "scan", "contrast", int, None)
-    mode = config_value(args, config, "mode", "scan", "mode", str, "color").lower()
-    xpos = config_value(args, config, "xpos", "region", "xpos", int, None)
-    ypos = config_value(args, config, "ypos", "region", "ypos", int, None)
-    width = config_value(args, config, "width", "region", "width", int, None)
-    height = config_value(args, config, "height", "region", "height", int, None)
-    jpeg_quality = config_value(
-        args, config, "jpeg_quality", "output", "jpeg_quality", int, 95
-    )
-    config_show_ui = (
-        config.getboolean("scanner", "show_ui")
-        if config.has_option("scanner", "show_ui")
-        else False
-    )
-    show_ui = args.show_ui or config_show_ui
-    config_strict = (
-        config.getboolean("scanner", "strict_settings")
-        if config.has_option("scanner", "strict_settings")
-        else True
-    )
-    strict = config_strict and not args.non_strict
-    config_probe = (
-        config.getboolean("diagnostics", "probe_writes")
-        if config.has_option("diagnostics", "probe_writes")
-        else True
-    )
-    probe_writes = config_probe and not args.no_probe_writes
-
-    if mode not in {"color", "grayscale", "bw"}:
-        raise SystemExit("mode must be color, grayscale, or bw")
-
-    pythoncom.CoInitialize()
+def _run_wia_command(
+    args: argparse.Namespace, config: configparser.ConfigParser
+) -> int:
+    """COM apartmentが有効な間にWIA処理を完結させる。"""
     reserved_output: Optional[Path] = None
     try:
+        if args.list_devices:
+            return list_devices()
+
+        device_name = config_value(
+            args, config, "device", "scanner", "device", str, None
+        )
+        output_dir = Path(
+            config_value(
+                args, config, "output_dir", "output", "directory", str, "./jpeg"
+            )
+        )
+        diagnostic_dir = Path(
+            config_value(
+                args,
+                config,
+                "diagnostic_dir",
+                "diagnostics",
+                "directory",
+                str,
+                "./diagnostics",
+            )
+        )
+        dpi = config_value(args, config, "dpi", "scan", "dpi", int, 600)
+        brightness = config_value(
+            args, config, "brightness", "scan", "brightness", int, None
+        )
+        contrast = config_value(
+            args, config, "contrast", "scan", "contrast", int, None
+        )
+        mode = config_value(args, config, "mode", "scan", "mode", str, "color").lower()
+        xpos = config_value(args, config, "xpos", "region", "xpos", int, None)
+        ypos = config_value(args, config, "ypos", "region", "ypos", int, None)
+        width = config_value(args, config, "width", "region", "width", int, None)
+        height = config_value(args, config, "height", "region", "height", int, None)
+        jpeg_quality = config_value(
+            args, config, "jpeg_quality", "output", "jpeg_quality", int, 95
+        )
+        config_show_ui = (
+            config.getboolean("scanner", "show_ui")
+            if config.has_option("scanner", "show_ui")
+            else False
+        )
+        show_ui = args.show_ui or config_show_ui
+        config_strict = (
+            config.getboolean("scanner", "strict_settings")
+            if config.has_option("scanner", "strict_settings")
+            else True
+        )
+        strict = config_strict and not args.non_strict
+        probe_writes = resolve_probe_writes(args, config)
+
+        if mode not in {"color", "grayscale", "bw"}:
+            raise ValueError("mode must be color, grayscale, or bw")
+        if dpi <= 0:
+            raise ValueError("dpi must be positive")
+
         info, device = select_device(device_name)
         item = get_scan_item(device)
 
@@ -801,13 +854,48 @@ def main() -> int:
         print(reserved_output.resolve())
         return 0
 
+    except (ValueError, configparser.Error) as exc:
+        remove_empty_reservation(reserved_output)
+        logging.error("Configuration error: %s", exc)
+        return 2
     except Exception as exc:
         remove_empty_reservation(reserved_output)
         logging.error("%s", exc)
         if args.verbose:
             logging.exception("Detailed failure")
         return 1
+
+
+def main() -> int:
+    """引数と設定を読み込み、診断または画像取り込みを実行する。"""
+    args = build_parser().parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+
+    if os.name != "nt":
+        logging.error("This utility supports Windows only.")
+        return 2
+    if not runtime_dependencies_available():
+        logging.error(
+            "pywin32 and Pillow are required. Run: py -m pip install -r requirements.txt"
+        )
+        return 2
+
+    config = read_config(Path(args.config))
+    try:
+        pythoncom.CoInitialize()
+    except Exception as exc:
+        logging.error("Could not initialize COM: %s", exc)
+        return 1
+
+    try:
+        # All WIA COM proxies live inside this function frame.  The frame is
+        # released before CoUninitialize(), preventing late IUnknown releases.
+        return _run_wia_command(args, config)
     finally:
+        gc.collect()
         pythoncom.CoUninitialize()
 
 
