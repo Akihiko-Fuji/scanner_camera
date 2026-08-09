@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import inspect
 import json
 import logging
 import math
@@ -43,6 +44,8 @@ from scanner_capture import (
     read_config,
     remove_empty_reservation,
     reserve_output_path,
+    resolve_probe_writes,
+    save_pillow_jpeg_atomically,
 )
 
 
@@ -80,6 +83,14 @@ class TwainTargetSupport:
 def runtime_bitness() -> int:
     """実行中Pythonプロセスのbitnessを返す。"""
     return struct.calcsize("P") * 8
+
+
+def automatic_dsm_description() -> str:
+    """pytwain 2.3.xが自動選択するDSMを診断表示用に説明する。"""
+    if runtime_bitness() == 32:
+        windir = os.environ.get("WINDIR", "%WINDIR%")
+        return f"auto:{windir}\\twain_32.dll (TWAIN 1)"
+    return "auto:twaindsm.dll"
 
 
 def _const(name: str) -> Optional[int]:
@@ -181,14 +192,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--list-devices", action="store_true", help="List TWAIN sources")
     parser.add_argument("--diagnose", action="store_true", help="Inspect TWAIN capabilities")
     parser.add_argument(
+        "--probe-writes",
+        action="store_true",
+        help="Explicitly enable no-change SET/read-back diagnostic probes",
+    )
+    parser.add_argument(
         "--no-probe-writes",
         action="store_true",
-        help="Do not perform no-change write/read-back probes",
+        help="Disable no-change SET/read-back diagnostic probes",
     )
     parser.add_argument("--device", help="Substring of TWAIN source name")
     parser.add_argument(
         "--dsm",
-        help="Path/name of TWAINDSM.dll matching the Python process bitness",
+        help="Explicit TWAIN DSM DLL path/name; normally leave unset for pytwain auto-selection",
     )
     parser.add_argument("--dpi", type=float, help="Horizontal and vertical DPI")
     parser.add_argument("--brightness", type=float, help="TWAIN brightness value")
@@ -306,9 +322,25 @@ def _values_equivalent(requested: Any, readback: Any, item_type: Optional[int]) 
 
 
 def _bool_value(text: Optional[str]) -> Optional[bool]:
+    """TWAINのon/off文字列を厳密に真偽値へ変換する。"""
     if text is None:
         return None
-    return text.lower() == "on"
+    normalized = text.strip().lower()
+    if normalized == "on":
+        return True
+    if normalized == "off":
+        return False
+    raise ValueError(f"Expected 'on' or 'off', got {text!r}")
+
+
+def _positive_float(value: Any) -> Optional[float]:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result) or result <= 0:
+        return None
+    return result
 
 
 def create_source_manager(dsm_name: Optional[str]) -> Any:
@@ -337,8 +369,9 @@ def select_source(manager: Any, name_substring: Optional[str]) -> Any:
     if not names:
         bitness = runtime_bitness()
         raise RuntimeError(
-            f"No {bitness}-bit TWAIN source was found. Confirm that Python, "
-            f"TWAINDSM.dll, and the scanner Data Source are all {bitness}-bit."
+            f"No {bitness}-bit TWAIN source was found. Confirm that the scanner "
+            f"Data Source matches the {bitness}-bit Python process and that the "
+            f"appropriate DSM is available ({automatic_dsm_description()})."
         )
     if name_substring:
         needle = name_substring.casefold()
@@ -366,7 +399,8 @@ def list_devices(dsm_name: Optional[str]) -> int:
         names = source_names(manager)
         if not names:
             print(
-                f"No {runtime_bitness()}-bit TWAIN source was found.",
+                f"No {runtime_bitness()}-bit TWAIN source was found. "
+                f"DSM={dsm_name or automatic_dsm_description()}",
                 file=sys.stderr,
             )
             return 1
@@ -374,7 +408,10 @@ def list_devices(dsm_name: Optional[str]) -> int:
             print(f"[{index}] {name}")
         return 0
     finally:
-        manager.close()
+        try:
+            manager.close()
+        except Exception:
+            logging.debug("TWAIN manager close failed", exc_info=True)
 
 
 def query_support(source: Any, capability_id: int) -> Any:
@@ -442,10 +479,12 @@ def capability_report(
                     source, capability_id, "get_capability_current"
                 )
                 if read_ok:
-                    write_probe = "WRITE_PROBE_OK"
-                    probe_detail = (
-                        f"readback={jsonable(current_scalar(read_payload))!r}"
-                    )
+                    readback = current_scalar(read_payload)
+                    if _values_equivalent(scalar, readback, item_type):
+                        write_probe = "WRITE_PROBE_OK"
+                    else:
+                        write_probe = "WRITE_PROBE_ADJUSTED"
+                    probe_detail = f"readback={jsonable(readback)!r}"
                 else:
                     write_probe = "WRITE_PROBE_READBACK_FAILED"
                     probe_detail = read_error
@@ -461,7 +500,7 @@ def capability_report(
         support = "NOT_EXPOSED_BY_TWAIN"
     elif write_probe == "WRITE_PROBE_OK":
         support = "EXPOSED_AND_SETTABLE"
-    elif write_probe == "WRITE_PROBE_FAILED":
+    elif write_probe in {"WRITE_PROBE_FAILED", "WRITE_PROBE_ADJUSTED"}:
         support = "EXPOSED_BUT_WRITE_REJECTED"
     elif cur_ok:
         support = "EXPOSED_READABLE"
@@ -633,7 +672,7 @@ def write_diagnostic_report(
             "python_version": platform.python_version(),
             "python_bitness": runtime_bitness(),
             "pytwain_version": pytwain_version,
-            "dsm_name": dsm_name or "auto:twaindsm.dll",
+            "dsm_name": dsm_name or automatic_dsm_description(),
             "probe_writes": probe_writes,
         },
         "source": {"name": source_name, "identity": identity},
@@ -690,7 +729,9 @@ def write_diagnostic_report(
     if supported_error:
         lines.append(f"CAP_SUPPORTEDCAPS warning: {supported_error}")
     for cap in reports:
-        type_label = cap.item_type_name if cap.item_type_name is not None else repr(cap.item_type)
+        type_label = (
+            cap.item_type_name if cap.item_type_name is not None else repr(cap.item_type)
+        )
         lines.append(
             f"0x{cap.capability_id:04X} {cap.name} support={cap.support} "
             f"type={type_label} probe={cap.write_probe}"
@@ -723,55 +764,34 @@ def set_capability(
     requested: Any,
     strict: bool,
     fallback_type: str,
-) -> None:
-    """CapabilityをSourceが公開するItemTypeに合わせて設定する。"""
+) -> Any:
+    """Capabilityを設定し、確認できた実際のread-back値を返す。"""
     if requested is None:
-        return
+        return None
     cap_id = _const(capability_name)
     if cap_id is None:
         message = f"{capability_name} is unavailable in pytwain constants."
         if strict:
             raise RuntimeError(message)
         logging.warning(message)
-        return
-    ok, item_type, _, error = capability_get(source, cap_id, "get_capability_current")
+        return None
+
+    ok, item_type, current_payload, error = capability_get(
+        source, cap_id, "get_capability_current"
+    )
     if not ok:
         message = f"{capability_name} is not exposed by this TWAIN source: {error}"
         if strict:
             raise RuntimeError(message + " Run --diagnose to inspect support.")
         logging.warning(message)
-        return
+        return None
+
+    original = current_scalar(current_payload)
     if item_type is None:
         item_type = preferred_item_type(source, cap_id, fallback_type)
+
     try:
         source.set_capability(cap_id, item_type, requested)
-        read_ok, _, read_payload, read_error = capability_get(
-            source, cap_id, "get_capability_current"
-        )
-        if read_ok:
-            readback = current_scalar(read_payload)
-            if not _values_equivalent(requested, readback, item_type):
-                message = (
-                    f"{capability_name} requested={requested!r} but source "
-                    f"read back {jsonable(readback)!r}."
-                )
-                if strict:
-                    raise RuntimeError(message)
-                logging.warning(message)
-            else:
-                logging.info(
-                    "%s requested=%r readback=%r",
-                    capability_name,
-                    requested,
-                    jsonable(readback),
-                )
-        else:
-            logging.info(
-                "%s requested=%r (readback failed: %s)",
-                capability_name,
-                requested,
-                read_error,
-            )
     except Exception as exc:
         message = (
             f"Could not set {capability_name} to {requested!r}: "
@@ -780,6 +800,38 @@ def set_capability(
         if strict:
             raise RuntimeError(message) from exc
         logging.warning(message)
+        return original
+
+    read_ok, _, read_payload, read_error = capability_get(
+        source, cap_id, "get_capability_current"
+    )
+    if not read_ok:
+        message = (
+            f"{capability_name} accepted requested={requested!r}, but GETCURRENT "
+            f"failed: {read_error}"
+        )
+        if strict:
+            raise RuntimeError(message)
+        logging.warning(message)
+        return None
+
+    readback = current_scalar(read_payload)
+    if not _values_equivalent(requested, readback, item_type):
+        message = (
+            f"{capability_name} requested={requested!r} but source "
+            f"read back {jsonable(readback)!r}."
+        )
+        if strict:
+            raise RuntimeError(message)
+        logging.warning(message)
+    else:
+        logging.info(
+            "%s requested=%r readback=%r",
+            capability_name,
+            requested,
+            jsonable(readback),
+        )
+    return readback
 
 
 def apply_scan_settings(
@@ -800,8 +852,8 @@ def apply_scan_settings(
     width: Optional[int],
     height: Optional[int],
     strict: bool,
-) -> None:
-    """TWAIN Capabilityを依存順序を意識して適用する。"""
+) -> tuple[Any, Any]:
+    """TWAIN Capabilityを依存順序で適用し、実際のX/Y解像度を返す。"""
     if twc is None:
         raise RuntimeError("pytwain is unavailable")
     pixel_types = {
@@ -814,9 +866,15 @@ def apply_scan_settings(
         set_capability(source, "ICAP_BITDEPTH", bit_depth, strict, "TWTY_UINT16")
 
     inches = getattr(twc, "TWUN_INCHES")
-    set_capability(source, "ICAP_UNITS", inches, strict, "TWTY_UINT16")
-    set_capability(source, "ICAP_XRESOLUTION", float(dpi), strict, "TWTY_FIX32")
-    set_capability(source, "ICAP_YRESOLUTION", float(dpi), strict, "TWTY_FIX32")
+    actual_units = set_capability(
+        source, "ICAP_UNITS", inches, strict, "TWTY_UINT16"
+    )
+    actual_dpi_x = set_capability(
+        source, "ICAP_XRESOLUTION", float(dpi), strict, "TWTY_FIX32"
+    )
+    actual_dpi_y = set_capability(
+        source, "ICAP_YRESOLUTION", float(dpi), strict, "TWTY_FIX32"
+    )
     set_capability(source, "ICAP_AUTOBRIGHT", autobright, strict, "TWTY_BOOL")
     set_capability(source, "ICAP_EXPOSURETIME", exposure_time, strict, "TWTY_FIX32")
     set_capability(source, "ICAP_BRIGHTNESS", brightness, strict, "TWTY_FIX32")
@@ -826,6 +884,28 @@ def apply_scan_settings(
     set_capability(source, "ICAP_LIGHTSOURCE", light_source, strict, "TWTY_UINT16")
 
     if any(value is not None for value in (xpos, ypos, width, height)):
+        if actual_units != inches:
+            message = (
+                "Cannot safely apply pixel-based scan region because ICAP_UNITS "
+                f"could not be confirmed as inches (readback={actual_units!r})."
+            )
+            if strict:
+                raise RuntimeError(message)
+            logging.warning(message)
+            return actual_dpi_x, actual_dpi_y
+
+        dpi_x = _positive_float(actual_dpi_x)
+        dpi_y = _positive_float(actual_dpi_y)
+        if dpi_x is None or dpi_y is None:
+            message = (
+                "Cannot safely apply pixel-based scan region because the actual "
+                f"resolution is unknown (x={actual_dpi_x!r}, y={actual_dpi_y!r})."
+            )
+            if strict:
+                raise RuntimeError(message)
+            logging.warning(message)
+            return actual_dpi_x, actual_dpi_y
+
         try:
             current = source.get_image_layout()
             frame = list(current[0])
@@ -834,32 +914,40 @@ def apply_scan_settings(
             if strict:
                 raise RuntimeError(f"Could not read TWAIN image layout: {exc}") from exc
             logging.warning("Could not read TWAIN image layout: %s", exc)
-            return
+            return actual_dpi_x, actual_dpi_y
+
         left, top, right, bottom = [float(value) for value in frame]
         old_width = right - left
         old_height = bottom - top
         if xpos is not None:
-            left = float(xpos) / dpi
+            left = float(xpos) / dpi_x
             right = left + old_width
         if ypos is not None:
-            top = float(ypos) / dpi
+            top = float(ypos) / dpi_y
             bottom = top + old_height
         if width is not None:
-            right = left + float(width) / dpi
+            right = left + float(width) / dpi_x
         if height is not None:
-            bottom = top + float(height) / dpi
+            bottom = top + float(height) / dpi_y
         new_frame = (left, top, right, bottom)
         try:
             source.set_image_layout(
                 new_frame, document_number, page_number, frame_number
             )
-            logging.info("TWAIN image layout applied: %r", new_frame)
+            logging.info(
+                "TWAIN image layout applied: %r using readback dpi=(%s, %s)",
+                new_frame,
+                dpi_x,
+                dpi_y,
+            )
         except Exception as exc:
             if strict:
                 raise RuntimeError(
                     f"Could not set TWAIN image layout to {new_frame!r}: {exc}"
                 ) from exc
             logging.warning("Could not set TWAIN image layout: %s", exc)
+
+    return actual_dpi_x, actual_dpi_y
 
 
 def save_twain_image_as_jpeg(
@@ -868,8 +956,9 @@ def save_twain_image_as_jpeg(
     quality: int,
     mode: str,
     dpi: float,
+    dpi_y: Optional[float] = None,
 ) -> None:
-    """pytwain native imageをBMP経由でJPEGへ保存する。"""
+    """pytwain native imageをBMP経由でJPEGへ原子的に保存する。"""
     with tempfile.TemporaryDirectory(prefix="fi65f_twain_") as temp_dir:
         bmp_path = Path(temp_dir) / "capture.bmp"
         image_object.save(str(bmp_path))
@@ -883,16 +972,17 @@ def save_twain_image_as_jpeg(
                 )
             else:
                 converted = source.convert("RGB")
-            converted.save(
-                output,
-                format="JPEG",
-                quality=max(1, min(100, int(quality))),
-                subsampling=0,
-                optimize=True,
-                dpi=(float(dpi), float(dpi)),
-            )
-            if converted is not source:
-                converted.close()
+            try:
+                effective_y = float(dpi if dpi_y is None else dpi_y)
+                save_pillow_jpeg_atomically(
+                    converted,
+                    output,
+                    quality,
+                    dpi=(float(dpi), effective_y),
+                )
+            finally:
+                if converted is not source:
+                    converted.close()
 
 
 def acquire_one(
@@ -903,14 +993,37 @@ def acquire_one(
     dpi: float,
     show_ui: bool,
 ) -> None:
-    """TWAIN native transferで1画像を取得してJPEG保存する。"""
+    """TWAIN native transferで1画像を取得し、実画像情報をJPEGへ反映する。"""
     captured = False
+    transfer_dpi = [float(dpi), float(dpi)]
+
+    def before(image_info: Any) -> None:
+        if not isinstance(image_info, dict):
+            return
+        actual_x = _positive_float(image_info.get("XResolution"))
+        actual_y = _positive_float(image_info.get("YResolution"))
+        if actual_x is not None:
+            transfer_dpi[0] = actual_x
+        if actual_y is not None:
+            transfer_dpi[1] = actual_y
+        logging.info(
+            "TWAIN DAT_IMAGEINFO resolution: x=%s y=%s",
+            transfer_dpi[0],
+            transfer_dpi[1],
+        )
 
     def after(image_object: Any, more: int) -> None:
         nonlocal captured
         try:
             if not captured:
-                save_twain_image_as_jpeg(image_object, output, quality, mode, dpi)
+                save_twain_image_as_jpeg(
+                    image_object,
+                    output,
+                    quality,
+                    mode,
+                    transfer_dpi[0],
+                    transfer_dpi[1],
+                )
                 captured = True
         finally:
             close = getattr(image_object, "close", None)
@@ -922,7 +1035,18 @@ def acquire_one(
             if cancel_all is not None:
                 raise cancel_all
 
-    source.acquire_natively(after=after, show_ui=show_ui, modal=False)
+    acquire = source.acquire_natively
+    try:
+        supports_before = "before" in inspect.signature(acquire).parameters
+    except (TypeError, ValueError):
+        supports_before = True
+
+    if supports_before:
+        acquire(after=after, before=before, show_ui=show_ui, modal=False)
+    else:
+        # Test doubles and older wrappers may not expose pytwain 2.3's before callback.
+        acquire(after=after, show_ui=show_ui, modal=False)
+
     if not captured:
         raise RuntimeError("The TWAIN source completed without returning an image.")
 
@@ -945,7 +1069,22 @@ def main() -> int:
         return 2
 
     config = read_config(Path(args.config))
-    dsm_name = config_value(args, config, "dsm", "twain", "dsm_name", str, None)
+    try:
+        dsm_name = config_value(args, config, "dsm", "twain", "dsm_name", str, None)
+        probe_writes = resolve_probe_writes(args, config)
+        autobright_text = config_value(
+            args, config, "autobright", "twain", "autobright", str, None
+        )
+        lamp_state_text = config_value(
+            args, config, "lamp_state", "twain", "lamp_state", str, None
+        )
+        autobright = _bool_value(autobright_text)
+        lamp_state = _bool_value(lamp_state_text)
+    except (ValueError, Exception) as exc:
+        # ConfigParser boolean errors and invalid on/off values are usage/config errors.
+        logging.error("Configuration error: %s", exc)
+        return 2
+
     if args.list_devices:
         try:
             return list_devices(dsm_name)
@@ -955,73 +1094,73 @@ def main() -> int:
                 logging.exception("Detailed failure")
             return 1
 
-    device_name = config_value(args, config, "device", "scanner", "device", str, None)
-    output_dir = Path(
-        config_value(args, config, "output_dir", "output", "directory", str, "./jpeg")
-    )
-    diagnostic_dir = Path(
-        config_value(
-            args,
-            config,
-            "diagnostic_dir",
-            "diagnostics",
-            "directory",
-            str,
-            "./diagnostics",
+    try:
+        device_name = config_value(
+            args, config, "device", "scanner", "device", str, None
         )
-    )
-    dpi = config_value(args, config, "dpi", "scan", "dpi", float, 600.0)
-    brightness = config_value(
-        args, config, "brightness", "scan", "brightness", float, None
-    )
-    contrast = config_value(args, config, "contrast", "scan", "contrast", float, None)
-    mode = config_value(args, config, "mode", "scan", "mode", str, "color").lower()
-    xpos = config_value(args, config, "xpos", "region", "xpos", int, None)
-    ypos = config_value(args, config, "ypos", "region", "ypos", int, None)
-    width = config_value(args, config, "width", "region", "width", int, None)
-    height = config_value(args, config, "height", "region", "height", int, None)
-    jpeg_quality = config_value(
-        args, config, "jpeg_quality", "output", "jpeg_quality", int, 95
-    )
-    gamma = config_value(args, config, "gamma", "twain", "gamma", float, None)
-    exposure_time = config_value(
-        args, config, "exposure_time", "twain", "exposure_time", float, None
-    )
-    autobright_text = config_value(
-        args, config, "autobright", "twain", "autobright", str, None
-    )
-    lamp_state_text = config_value(
-        args, config, "lamp_state", "twain", "lamp_state", str, None
-    )
-    light_source = config_value(
-        args, config, "light_source", "twain", "light_source", int, None
-    )
-    bit_depth = config_value(
-        args, config, "bit_depth", "twain", "bit_depth", int, None
-    )
-    config_show_ui = (
-        config.getboolean("scanner", "show_ui")
-        if config.has_option("scanner", "show_ui")
-        else False
-    )
-    show_ui = args.show_ui or config_show_ui
-    config_strict = (
-        config.getboolean("scanner", "strict_settings")
-        if config.has_option("scanner", "strict_settings")
-        else True
-    )
-    strict = config_strict and not args.non_strict
-    config_probe = (
-        config.getboolean("diagnostics", "probe_writes")
-        if config.has_option("diagnostics", "probe_writes")
-        else True
-    )
-    probe_writes = config_probe and not args.no_probe_writes
+        output_dir = Path(
+            config_value(
+                args, config, "output_dir", "output", "directory", str, "./jpeg"
+            )
+        )
+        diagnostic_dir = Path(
+            config_value(
+                args,
+                config,
+                "diagnostic_dir",
+                "diagnostics",
+                "directory",
+                str,
+                "./diagnostics",
+            )
+        )
+        dpi = config_value(args, config, "dpi", "scan", "dpi", float, 600.0)
+        brightness = config_value(
+            args, config, "brightness", "scan", "brightness", float, None
+        )
+        contrast = config_value(
+            args, config, "contrast", "scan", "contrast", float, None
+        )
+        mode = config_value(args, config, "mode", "scan", "mode", str, "color").lower()
+        xpos = config_value(args, config, "xpos", "region", "xpos", int, None)
+        ypos = config_value(args, config, "ypos", "region", "ypos", int, None)
+        width = config_value(args, config, "width", "region", "width", int, None)
+        height = config_value(args, config, "height", "region", "height", int, None)
+        jpeg_quality = config_value(
+            args, config, "jpeg_quality", "output", "jpeg_quality", int, 95
+        )
+        gamma = config_value(args, config, "gamma", "twain", "gamma", float, None)
+        exposure_time = config_value(
+            args, config, "exposure_time", "twain", "exposure_time", float, None
+        )
+        light_source = config_value(
+            args, config, "light_source", "twain", "light_source", int, None
+        )
+        bit_depth = config_value(
+            args, config, "bit_depth", "twain", "bit_depth", int, None
+        )
+        config_show_ui = (
+            config.getboolean("scanner", "show_ui")
+            if config.has_option("scanner", "show_ui")
+            else False
+        )
+        show_ui = args.show_ui or config_show_ui
+        config_strict = (
+            config.getboolean("scanner", "strict_settings")
+            if config.has_option("scanner", "strict_settings")
+            else True
+        )
+        strict = config_strict and not args.non_strict
+    except Exception as exc:
+        logging.error("Configuration error: %s", exc)
+        return 2
 
     if mode not in {"color", "grayscale", "bw"}:
-        raise SystemExit("mode must be color, grayscale, or bw")
+        logging.error("Configuration error: mode must be color, grayscale, or bw")
+        return 2
     if dpi <= 0:
-        raise SystemExit("dpi must be positive")
+        logging.error("Configuration error: dpi must be positive")
+        return 2
 
     manager = None
     source = None
@@ -1046,8 +1185,8 @@ def main() -> int:
             contrast=contrast,
             gamma=gamma,
             exposure_time=exposure_time,
-            autobright=_bool_value(autobright_text),
-            lamp_state=_bool_value(lamp_state_text),
+            autobright=autobright,
+            lamp_state=lamp_state,
             light_source=light_source,
             bit_depth=bit_depth,
             xpos=xpos,
