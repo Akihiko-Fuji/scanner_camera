@@ -719,8 +719,9 @@ def save_pillow_jpeg_atomically(
         if dpi is not None:
             kwargs["dpi"] = (float(dpi[0]), float(dpi[1]))
         image.save(temp_path, **kwargs)
-        # File data is complete before the reserved final path is replaced.
-        with temp_path.open("rb") as handle:
+        # Windows' fsync/_commit requires a writable file descriptor.
+        with temp_path.open("r+b") as handle:
+            handle.flush()
             os.fsync(handle.fileno())
         os.replace(str(temp_path), str(output))
     finally:
