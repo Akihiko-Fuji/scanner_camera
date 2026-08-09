@@ -11,18 +11,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Final deployment compatibility lane: Windows 8 uses Python 3.8 x86.
-          # The runner OS is newer than Windows 8, so this validates Python/x86
-          # compatibility, not the Windows 8 kernel itself.
+          # Final deployment compatibility lane. The runner OS is newer than
+          # Windows 8, so this validates Python/x86 and pinned dependency
+          # compatibility, not the Windows 8 kernel or scanner driver itself.
           - python-version: "3.8"
             architecture: x86
-            runtime-label: win8-x86
+            expected-bits: 32
+            requirements-file: requirements-dev-win8-x86.txt
           - python-version: "3.11"
             architecture: x64
-            runtime-label: current-x64
+            expected-bits: 64
+            requirements-file: requirements-dev.txt
           - python-version: "3.12"
             architecture: x64
-            runtime-label: current-x64
+            expected-bits: 64
+            requirements-file: requirements-dev.txt
 
     name: pytest (${{ matrix.python-version }} / ${{ matrix.architecture }})
 
@@ -36,10 +39,20 @@ jobs:
           cache: pip
 
       - name: Verify Python runtime
-        run: python -c "import platform, struct; print(platform.python_version(), struct.calcsize('P') * 8)"
+        run: >-
+          python -c "import platform, struct;
+          bits=struct.calcsize('P')*8;
+          print(platform.python_version(), bits);
+          assert bits == ${{ matrix.expected-bits }}"
 
       - name: Install dependencies
-        run: python -m pip install -r requirements-dev.txt
+        run: python -m pip install -r ${{ matrix.requirements-file }}
+
+      - name: Verify dependency consistency
+        run: python -m pip check
+
+      - name: Compile sources
+        run: python -m compileall -q scanner_capture.py twain_capture.py tests
 
       - name: Run tests
         run: python -m pytest --cov=scanner_capture --cov=twain_capture --cov-report=term-missing

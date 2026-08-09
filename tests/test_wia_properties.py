@@ -242,8 +242,10 @@ def test_set_property_normalizes_value_and_reads_back(
     assert "requested=955 applied=1000" in caplog.text
 
 
-def test_set_property_wraps_driver_write_failure(fake_property_cls, fake_item_cls) -> None:
-    prop = fake_property_cls(
+def test_set_property_write_failure_respects_strict_mode(
+    fake_property_cls, fake_item_cls, caplog: pytest.LogCaptureFixture
+) -> None:
+    strict_prop = fake_property_cls(
         target.WIA_IPS_BRIGHTNESS,
         0,
         subtype=target.WIA_PROP_RANGE,
@@ -252,7 +254,23 @@ def test_set_property_wraps_driver_write_failure(fake_property_cls, fake_item_cl
         step=1,
         reject_write=True,
     )
-    item = fake_item_cls([prop])
-
+    strict_item = fake_item_cls([strict_prop])
     with pytest.raises(RuntimeError, match="Could not set WIA_IPS_BRIGHTNESS"):
-        target.set_property(item, target.WIA_IPS_BRIGHTNESS, 100, strict=False)
+        target.set_property(strict_item, target.WIA_IPS_BRIGHTNESS, 100, strict=True)
+
+    non_strict_prop = fake_property_cls(
+        target.WIA_IPS_BRIGHTNESS,
+        0,
+        subtype=target.WIA_PROP_RANGE,
+        minimum=-1000,
+        maximum=1000,
+        step=1,
+        reject_write=True,
+    )
+    non_strict_item = fake_item_cls([non_strict_prop])
+    with caplog.at_level(logging.WARNING):
+        target.set_property(
+            non_strict_item, target.WIA_IPS_BRIGHTNESS, 100, strict=False
+        )
+    assert "Could not set WIA_IPS_BRIGHTNESS" in caplog.text
+    assert non_strict_prop.Value == 0
