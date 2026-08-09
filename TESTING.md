@@ -1,27 +1,27 @@
 # テスト方針
 
-本プロジェクトはWindows専用で、WIAとTWAINの2経路を持つ。最終運用ターゲットは**Windows 8 32-bit + Python 3.8 x86**とする。
+本プロジェクトはWindows専用で、WIAとTWAINの2経路を持つ。最終運用ターゲットは**Windows 8 32-bit + Python 3.8.10 x86**とする。
 
-通常のCIではfi-65F実機もWindows 8カーネルも使用できないため、検証を次の3層へ分ける。
+検証を次の4層へ分ける。
 
-1. 自動単体テスト
-2. Python 3.8 x86互換CI
-3. Windows 8 32-bit + fi-65F実機確認
+1. 純粋ロジック・テストダブルによる単体テスト
+2. Python 3.8 x86 / 3.11 x64 / 3.12 x64 CI
+3. Windows 8 32-bit + fi-65F実機試験
+4. 公開前Release Candidate判定
 
-目的は単なる行カバレッジではなく、WIA/TWAINのどちらを使っても同じCLI契約、同じ保存契約、同じ失敗時挙動を維持し、最終ターゲットで使用可能なPython/依存関係を継続確認することである。
+CIの成功だけでは実機動作・公開可否を判定しない。
 
 ## 1. 対象環境
 
 ### 1.1 最終ターゲット
 
 - Windows 8 32-bit
-- Python 3.8.x x86
-- 推奨 Python 3.8.10 x86
+- Python 3.8.10 x86
 - fi-65F 32-bit WIA Driver
 - fi-65F 32-bit TWAIN Data Source
-- TWAIN使用時は32-bit DSM
+- `pytwain==2.3.0`
 
-TWAINは以下のbitnessを一致させる。
+TWAINはbitnessを一致させる。
 
 ```text
 Python process      32-bit
@@ -29,87 +29,100 @@ TWAIN DSM           32-bit
 TWAIN Data Source   32-bit
 ```
 
+32-bit環境でpytwainの自動DSM選択を使う場合は、通常Windowsの`%WINDIR%\twain_32.dll`経路を使用する。明示DSM指定は自動選択で成立しない場合に限定する。
+
 ### 1.2 CI互換環境
 
-GitHub Actionsでは次を実行する。
+GitHub Actions：
 
 - Python 3.8 / x86
 - Python 3.11 / x64
 - Python 3.12 / x64
 
-Python 3.8 x86 laneは最終ターゲットの**Pythonバージョン・32-bitアーキテクチャ・依存パッケージ互換性**を検証する。
+Python 3.8 x86 laneは`requirements-dev-win8-x86.txt`を使用し、Windows 8用に固定した依存セットを検証する。
 
-ただしGitHub Actions runnerはWindows 8ではない。したがって、このlaneの成功だけでWindows 8上のCOM/TWAIN実動作を保証したとは扱わない。
+各laneで以下を実施する。
 
-## 2. 自動単体テスト
+1. pointer sizeによるbitness assertion
+2. dependency install
+3. `python -m pip check`
+4. `python -m compileall`
+5. pytest + coverage
 
-### 2.1 共通契約
+GitHub Actions runnerはWindows 8ではないため、x86 lane成功だけでWindows 8上のCOM/TWAIN/Driver実動作を保証しない。
 
-- `config.ini`よりCLI指定を優先する
+## 2. 共通の自動試験契約
+
+- CLI指定を`config.ini`より優先する
 - `DSC_####.jpeg`を既存最大番号の次で採番する
-- 排他的なファイル予約で上書きを避ける
-- 取り込み失敗時は空の予約ファイルだけ削除する
-- JPEG qualityを有効範囲へ収める
-- color / grayscale / bwの出力モードを維持する
-- bwは明示的な二値化を行う
-- strictでは未対応設定・read-back不一致をエラーとする
-- non-strictでは警告して継続する
-- 診断と通常取得で出力ディレクトリを分離する
-- Windows 32-bit / 64-bitの双方をコード上で許容する
+- `O_EXCL`による予約で既存画像を上書きしない
+- JPEG encodeは同一ディレクトリの一時ファイルへ行い、完成後に`os.replace()`する
+- encode失敗時に部分JPEGを完成ファイルとして残さない
+- 取り込み失敗時は0-byte予約を削除する
+- color / grayscale / bwを維持する
+- bwは128 thresholdで二値化する
+- strictは未対応、SET失敗、read-back不能、不一致を失敗にする
+- non-strictは警告して安全に継続する
+- 診断はread-onlyを既定とする
+- write probeは`--probe-writes`で明示的に有効化する
+- `--probe-writes`と`--no-probe-writes`の同時指定を拒否する
+- `jpeg/` / `diagnostics/`はGit管理対象外とする
 
-### 2.2 WIA
+## 3. WIA自動テスト
 
-COM/WIAオブジェクトをテストダブルへ置き換え、以下を検証する。
+COM/WIAをテストダブルへ置き換え、以下を検証する。
 
-- WIA Scanner列挙と選択
-- WIA Property制約のRANGE / LIST / FLAG解釈
+- Scanner列挙と名前選択
+- Property制約のRANGE / LIST / FLAG解釈
 - read-only判定
-- 対象Property診断ステータス
-- no-change write/read-back probe
+- 全Property診断と対象Property support判定
+- read-only既定診断
+- 明示的no-change write/read-back probe
 - unsupported / read-only / SET失敗時のstrict / non-strict
-- DPI / mode / brightness / contrast / scan region設定
-- WIA転送
+- Driverが正規化した値のread-back
+- DPI / mode / brightness / contrast / scan region
+- WIA transfer
 - color / grayscale / bw JPEG
-- 診断CLIフロー
-- 通常取得CLIフロー
-- COM初期化 / 解放
-- 失敗時の予約ファイル後始末
+- atomic JPEG成功・失敗
+- `DSC_####.jpeg`採番
+- 失敗時予約削除
+- COM `CoInitialize()` / `CoUninitialize()`
+- **WIA COM proxyを保持する処理スコープの終了とGCが`CoUninitialize()`より先であること**
 - 32-bit Windows runtimeを拒否しないこと
 
-### 2.3 TWAIN
+実機では、以前観測された`Win32 exception occurred releasing IUnknown`が再発しないことを別途確認する。
 
-TWAIN Data SourceとSource Managerをテストダブルへ置き換え、WIA側と同等の責務まで検証する。
+## 4. TWAIN自動テスト
 
-#### Source Manager / Source選択
+### 4.1 Source Manager / Source選択
 
-- Source Manager生成時のアプリケーションIdentity
+- Source Manager Identity
 - DSM明示指定
-- Source一覧取得
-- Source名の大文字小文字を無視した部分一致
-- 未指定時の先頭Source選択
-- 一致なし
-- 曖昧一致拒否
-- Source open失敗
-- 正常終了・異常終了時のSource / Source Manager close
-- Source未検出時に実行中Pythonの32/64-bitを表示すること
+- process bitness判定
+- 32-bit自動DSM説明に`twain_32.dll`が現れること
+- Source一覧
+- case-insensitive部分一致
+- 一致なし / 曖昧一致 / open失敗
+- Source / Source Manager close
 
-#### Capability診断
+### 4.2 Capability診断
 
-- pytwain戻り値のONEVALUE相当正規化
-- RANGE相当からCurrentValue抽出
-- ENUMERATION相当からCurrentIndexの値抽出
-- `CAP_SUPPORTEDCAPS`解析
+- ONEVALUE相当値の正規化
+- RANGEからCurrentValue抽出
+- ENUMERATIONからCurrentIndex抽出
+- `CAP_SUPPORTEDCAPS`
 - `GET`
 - `GETCURRENT`
 - `GETDEFAULT`
 - `MSG_QUERYSUPPORT`
-- 取得失敗時の安全な診断化
-- Sourceが公開しないCapabilityの判定
-- no-change SET/read-back probe
-- SET拒否の判定
-- scalarでないCurrentValueを無理にSETしないこと
-- scanner_camera対象外Capabilityを一律SETしないこと
-- TWAIN定数がpytwain側に存在しない場合の診断
+- 読み出し失敗の診断化
+- 未公開Capability
+- read-only既定診断
+- 明示的no-change SET/read-back probe
+- scalarでないCurrentValueをSETしない
+- scanner_camera対象外Capabilityへ無差別SETしない
+- SET拒否
+- no-change SET後の値調整
 
 重点Capability：
 
@@ -129,183 +142,170 @@ TWAIN Data SourceとSource Managerをテストダブルへ置き換え、WIA側�
 - `ICAP_UNITS`
 - `ICAP_XFERMECH`
 
-#### TWAIN設定
+### 4.3 SET / read-back契約
 
-- pixel typeとcolor / grayscale / bwの対応
-- Data Sourceが返すItemTypeを優先してSET
-- ItemType不明時の型フォールバック
-- DPI設定
-- brightness / contrast
-- autobright
-- exposure time
-- gamma
-- lamp state
-- light source
-- bit depth
-- strict / non-strict
-- SET後のread-back値確認
-- Sourceが要求値を丸めた/無視した場合のstrictエラー
-- `TWTY_FIX32`の1 LSB相当の丸め誤差許容
+- Data SourceのCurrent ItemTypeを優先
+- ItemType不明時のフォールバック
+- SET後に必ず`GETCURRENT`を確認
+- strict: SET拒否で失敗
+- strict: `GETCURRENT`不能で失敗
+- strict: 要求値とread-back不一致で失敗
+- non-strict: SET拒否を警告
+- non-strict: read-back不能を警告
+- non-strict: 値調整を警告し、確認できた実値を後続処理へ渡す
+- `TWTY_FIX32`は16.16固定小数点1 LSB相当だけ許容
+- `autobright` / `lamp_state`は`on` / `off`以外を設定エラーにする
 
-#### DAT_IMAGELAYOUT
+### 4.4 `DAT_IMAGELAYOUT`
 
-- 現在layout取得
-- default layout取得
-- no-change SET probe
-- SET拒否判定
-- ピクセル値からインチへの換算
-- xpos / ypos / width / heightの部分指定
-- layout read失敗
-- layout write失敗
+- current/default layout取得
+- 明示的no-change SET probe
+- SET拒否
+- `ICAP_UNITS=inches`のread-back確認
+- X/Y DPIをそれぞれread-back
+- pixel→inch換算に**要求DPIではなく実read-back DPI**を使用
+- X/Y DPIが異なる場合に別々に換算
+- actual units / DPI不明時はunsafeなregion設定をしない
+- layout read/write失敗
 
-#### 画像取得と保存
+### 4.5 native transfer / JPEG
 
 - native transfer callback
-- 最初の画像だけ保存すること
-- TWAIN image objectのclose
-- 画像が返らなかった場合のエラー
-- color / grayscale / bw JPEG
-- bwの128 threshold
-- JPEG DPIメタデータ
-- quality clamp
-- `DSC_####.jpeg`採番
-- 失敗時の空予約ファイル削除
+- first imageだけ保存
+- Twain image object close
+- no image error
+- color / grayscale / bw
+- bw threshold
+- JPEG quality clamp
+- `DAT_IMAGEINFO`の`XResolution` / `YResolution`をJPEG DPI metadataへ反映
+- `DAT_IMAGEINFO`が取得できない場合のfallback
+- atomic JPEG保存
+- 失敗時予約cleanup
 
-#### CLI統合
+## 5. 自動テストの実行
 
-- Windows以外を拒否
-- **32-bit Windowsを許容**
-- 64-bit Windowsも許容
-- 実行時依存不足を拒否
-- `--list-devices`
-- `--diagnose`
-- `--no-probe-writes`
-- TWAIN固有CLI引数
-- 通常取得
-- CLI値が設定適用層へ渡ること
-- 正常・異常終了時のリソース解放
-
-## 3. 自動テストの実行
-
-通常の開発環境：
+### 5.1 一般開発環境
 
 ```bat
 python -m pip install -r requirements-dev.txt
-python -m pytest
+python -m pip check
+python -m compileall -q scanner_capture.py twain_capture.py tests
+python -m pytest --cov=scanner_capture --cov=twain_capture --cov-report=term-missing
 ```
 
-カバレッジ：
+### 5.2 Windows 8 x86固定依存
 
 ```bat
-python -m pytest ^
-  --cov=scanner_capture ^
-  --cov=twain_capture ^
-  --cov-report=term-missing
-```
-
-最終ターゲット相当のPython 3.8 x86環境：
-
-```bat
-py -3.8-32 -m pip install -r requirements-dev.txt
+py -3.8-32 -m pip install -r requirements-dev-win8-x86.txt
+py -3.8-32 -m pip check
+py -3.8-32 -m compileall -q scanner_capture.py twain_capture.py tests
 py -3.8-32 -m pytest
 ```
 
-`requirements.txt` / `requirements-dev.txt`はPython 3.8で利用可能なパッケージへ条件分岐する。
+固定runtime：
 
-GitHub Actionsでは`actions/setup-python`がPATHへ配置したPythonを確実に使用するため、`py`ランチャーではなく`python -m ...`で実行する。
-
-CI内では次のコマンドでbitnessも表示する。
-
-```bat
-python -c "import platform, struct; print(platform.python_version(), struct.calcsize('P') * 8)"
+```text
+pywin32==308
+Pillow==10.4.0
+pytwain==2.3.0
 ```
 
-## 4. 実機確認: Windows 8 32-bit
+## 6. Windows 8 32-bit実機試験
 
-この章が最終運用可否の判定になる。
+この章を通過して初めて、最終運用環境で「動作確認済み」とする。
 
-### 4.1 Python確認
+### 6.1 Python / dependency確認
 
 ```bat
 py -3.8-32 -c "import platform, struct; print(platform.python_version(), struct.calcsize('P') * 8)"
-```
-
-期待値：
-
-```text
-3.8.x 32
-```
-
-### 4.2 依存関係
-
-```bat
-py -3.8-32 -m pip install -r requirements.txt
-```
-
-確認：
-
-```bat
+py -3.8-32 -m pip install -r requirements-win8-x86.txt
+py -3.8-32 -m pip check
 py -3.8-32 -c "import win32com.client, PIL, twain; print('OK')"
 ```
 
-### 4.3 WIA
+期待：
 
-1. Scanner列挙
+```text
+3.8.10 32
+OK
+```
+
+### 6.2 WIA — 列挙
 
 ```bat
 py -3.8-32 scanner_capture.py --list-devices
 ```
 
-2. WIA診断
+確認：fi-65Fが一意に列挙される。
+
+### 6.3 WIA — read-only診断
 
 ```bat
 py -3.8-32 scanner_capture.py --device fi-65F --diagnose
 ```
 
-3. 確認項目
+確認：
 
-- fi-65Fが列挙される
-- 診断JSON/TXTが作成される
-- brightness / contrast / resolutionの範囲
-- 600 dpi設定
-- SET/read-back
+- JSON/TXT生成
+- `probe_writes=false`
+- DPI / brightness / contrast / thresholdの公開状態
+- Driver/Device ID
+- 診断のみでスキャン・意図しない設定変更が起きない
 
-4. 実スキャン
+### 6.4 WIA — 明示write probe
+
+read-only診断が安定した後だけ実施する。
+
+```bat
+py -3.8-32 scanner_capture.py --device fi-65F --diagnose --probe-writes
+```
+
+確認：no-change SET/read-backとDriverの応答。
+
+### 6.5 WIA — 実取得
 
 ```bat
 py -3.8-32 scanner_capture.py --device fi-65F --dpi 600 --mode color --brightness 0 --contrast 0
 ```
 
-5. `./jpeg/DSC_####.jpeg`の生成、画像寸法、スキャン完了を確認
+確認：
 
-参考として64-bit開発機では、Python 3.9.13 64-bitからfi-65FをWIA認識し、75～600 dpi、brightness/contrast -128～127の公開とSET/read-backを確認済み。ただしWindows 8 x86では別途再確認する。
+- `DSC_####.jpeg`が0 byteでない
+- JPEGとして再オープンできる
+- 期待する画像寸法
+- Scannerが正常終了する
+- **終了時に`Win32 exception occurred releasing IUnknown`が出ない**
+- 連続3回以上でCOM関連warning/異常終了がない
 
-## 5. 実機確認: TWAIN 32-bit
+## 7. TWAIN 32-bit実機試験
 
-### 5.1 bitness確認
-
-Pythonは32-bitであること。さらに32-bit TWAIN DSMと32-bit fi-65F Data Sourceを使用する。
-
-### 5.2 TWAIN Source列挙
+### 7.1 Source列挙
 
 ```bat
 py -3.8-32 twain_capture.py --list-devices
 ```
 
-Sourceが見えない場合はPython / DSM / Data Sourceのbitnessを最初に確認する。
+確認：
 
-### 5.3 write probeなしで初回診断
+- fi-65F 32-bit Data Sourceが列挙される
+- Source未検出時の診断文が32-bit Pythonと自動DSMを正しく示す
+
+通常はDSMを明示せず、pytwainの自動選択から開始する。
+
+### 7.2 TWAIN read-only診断
 
 ```bat
-py -3.8-32 twain_capture.py --device fi-65F --diagnose --no-probe-writes
+py -3.8-32 twain_capture.py --device fi-65F --diagnose
 ```
 
-JSON/TXTで以下を重点確認する。
+重点確認：
 
+- `environment.python_bitness == 32`
+- DSM表示
+- `CAP_SUPPORTEDCAPS`
 - `ICAP_PIXELTYPE`
 - `ICAP_XRESOLUTION` / `ICAP_YRESOLUTION`
-- `ICAP_BRIGHTNESS`
-- `ICAP_CONTRAST`
+- `ICAP_BRIGHTNESS` / `ICAP_CONTRAST`
 - `ICAP_AUTOBRIGHT`
 - `ICAP_EXPOSURETIME`
 - `ICAP_GAMMA`
@@ -314,71 +314,113 @@ JSON/TXTで以下を重点確認する。
 - `ICAP_LIGHTPATH`
 - `ICAP_BITDEPTH`
 - `DAT_IMAGELAYOUT`
+- `probe_writes=false`
 
-### 5.4 no-change write probe
+### 7.3 TWAIN明示write probe
 
-Sourceが安定して応答したら実施する。
+read-only診断が安定した後だけ実施する。
 
 ```bat
-py -3.8-32 twain_capture.py --device fi-65F --diagnose
+py -3.8-32 twain_capture.py --device fi-65F --diagnose --probe-writes
 ```
 
-現在値を同じ値で再SETする対象だけをprobeし、Source全Capabilityには書き込まない。
+対象Capabilityだけを現在値で再SETする。全Capabilityには書き込まない。
 
-### 5.5 WIAと同条件の基本取り込み
+### 7.4 WIAと同条件のTWAIN取得
 
 ```bat
 py -3.8-32 twain_capture.py --device fi-65F --dpi 600 --mode color --brightness -128 --contrast 0
 ```
 
-確認項目：
+確認：
 
-- `DSC_####.jpeg`生成
-- 600 dpi
-- 画像寸法
-- WIA画像との明るさ・色・階調差
-- スキャン所要時間
-- Data Source UIを出さない状態で完了すること
+- JPEG生成
+- 実画像寸法
+- `DAT_IMAGEINFO` X/Y resolutionログ
+- JPEG DPI metadataが実解像度と一致
+- WIAとの明るさ・色・階調差
+- 所要時間
+- UIなしで終了
+- Source/DSMが次回実行で正常に再openできる
 
-### 5.6 TWAIN固有Capability試験
+### 7.5 SourceによるDPI調整試験
 
-診断でSET可能と確認された場合だけ個別に実施する。
+Sourceが要求DPIを丸めるケースが作れる場合、`--non-strict`で確認する。
+
+確認：
+
+- warningにrequested/read-backが出る
+- region指定はread-back DPIで換算される
+- JPEG DPIは`DAT_IMAGEINFO`の実値を優先する
+
+### 7.6 TWAIN固有Capability
+
+診断でSET可能と確認された場合だけ実施する。
 
 ```bat
 py -3.8-32 twain_capture.py --device fi-65F --lamp-state off
-py -3.8-32 twain_capture.py --device fi-65F --autobright off --exposure-time <診断で許可された値>
+py -3.8-32 twain_capture.py --device fi-65F --autobright off --exposure-time <許可値>
 ```
 
-`ICAP_LAMPSTATE`が公開されない、またはSET拒否の場合はLED停止をハード側改造の課題として扱う。
+`ICAP_LAMPSTATE`が未公開/SET不能ならLED停止はハード側課題として扱う。
 
-`ICAP_EXPOSURETIME`が公開された場合は、値を変えたときの画像輝度だけでなく、飽和、暗部S/N、走査時間の変化も記録し、単なるデジタル輝度補正との違いを確認する。
+`ICAP_EXPOSURETIME`が公開された場合は画像平均輝度だけではなく、飽和、暗部S/N、走査時間の変化を記録し、単なるデジタルbrightnessとの違いを評価する。
 
-## 6. CIで保証しないこと
+## 8. ハード改造後の再試験
 
-以下はWindows 8実機試験でのみ確認できる。
+LED/導光系を変更した後は最低限以下を再実施する。
 
-- Windows 8 32-bitでのPython 3.8実動作
-- fi-65Fの32-bit WIA Driver
-- fi-65Fの32-bit TWAIN Data Source名
-- PaperStream TWAINの実Capability集合
-- 32-bit DSM/Data Sourceの組み合わせ
-- Capability値の単位・範囲
-- Data Source固有のSET副作用
-- LEDのソフトウェア制御可否
-- 実際のnative transfer
-- CISの積分時間・走査時間
-- 実画像のS/N、ダイナミックレンジ、色再現
-- ハード改造後の動作
+- WIA read-only診断
+- WIA実取得
+- TWAIN read-only診断
+- TWAIN実取得
+- LED光漏れ確認
+- 外部投影像の結像確認
+- 複数回連続取得
+- Scanner再起動後の再接続
 
-## 7. 再確認トリガー
+## 9. CIで保証しないこと
 
-以下の変更時はWindows 8実機確認を再実施する。
+- Windows 8カーネル上の実動作
+- fi-65F 32-bit WIA Driver
+- fi-65F 32-bit TWAIN Data Source
+- PaperStream固有Capability
+- DSM/Data Source固有の状態遷移・副作用
+- 実native transfer
+- LEDソフト制御可否
+- CIS積分時間・走査時間
+- S/N、ダイナミックレンジ、色再現
+- ハード改造後の挙動
 
-- PaperStream/WIA/TWAINドライバー更新
-- TWAIN DSM更新
+## 10. Release Candidate判定
+
+公開候補へ進むには以下をすべて満たす。
+
+- 3系統CIが同じHEADでcompleted/success
+- x86 laneが固定requirementsを実使用
+- WIA実機列挙・read-only診断・実取得成功
+- TWAIN実機列挙・read-only診断・実取得成功
+- WIA COM解放warningが再発しない
+- 連続取得で壊れたJPEG・0-byte残留がない
+- READMEの実測値を実機結果へ更新
+- 診断JSON/TXTに公開してはいけない個人情報・機密情報がないことを確認
+- project LICENSEと依存ライセンスの扱いを確定
+
+詳細は`PUBLIC_RELEASE_CHECKLIST.md`で記録する。
+
+## 11. 再確認トリガー
+
+以下の変更時は実機確認を再実施する。
+
+- WIA/TWAIN/PaperStream Driver更新
+- TWAIN DSM変更
 - Python 3.8環境変更
+- `requirements-win8-x86.txt`変更
 - pywin32/Pillow/pytwain更新
-- fi-65FのUSB接続条件変更
-- WIA/TWAIN Capability制御コード変更
-- 画像保存方式変更
-- LED/導光系のハード改造
+- Capability設定順変更
+- strict/non-strict契約変更
+- region換算変更
+- native transfer callback変更
+- JPEG保存方式変更
+- COM lifecycle変更
+- LED/導光系ハード改造
