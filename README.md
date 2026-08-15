@@ -256,7 +256,7 @@ py -3.8-32 tools\twain_camera_caps_probe.py --probe-writes
 py -3.8-32 scanner_capture.py --list-devices
 ```
 
-### 7.2 診断
+### 7.2 診断とfi-65F実機結果
 
 ```bat
 py -3.8-32 scanner_capture.py --device fi-65F --diagnose
@@ -269,15 +269,23 @@ py -3.8-32 scanner_capture.py --device fi-65F --diagnose
 ./diagnostics/wia_diagnostic_YYYYMMDD_HHMMSS.txt
 ```
 
-64-bit開発機でのfi-65F実測では以下を確認済みです。
+2026-08-15の64-bit開発機上のfi-65F実機診断では、read-only診断に加えて`--probe-writes`によるno-change SET/read-backを実施し、主要な公開Propertyが実際に書き戻せることを確認しました。
 
-- X/Y解像度: 75～600 dpi
-- brightness: -128～127
-- contrast: -128～127
-- threshold: 1～255
-- 24 bit RGB出力
+| WIA項目 | 実機結果 |
+|---|---|
+| X/Y解像度 | 75～600 dpi、read/write確認 |
+| brightness | -128～127、read/write確認、設定変更に実画像が追従 |
+| contrast | -128～127、read/write確認 |
+| threshold | 1～255、read/write確認 |
+| scan position / extent | 公開範囲内でread/write確認 |
+| rotation | `0`のみ公開 |
+| 画像形式 | 24 bit RGB、BMP transferを使用 |
+| orientation / mirror / invert / warm-up | 直接Propertyは非公開 |
+| 物理露光時間 / 積分時間 / analog gain / lamp intensity | 対応する直接Propertyは確認できず |
 
-これは64-bit WIA環境の実測であり、Windows 8 x86では再診断します。
+WIAの`brightness`は設定変更に対して実画像が変化することを確認していますが、これは**物理的なCIS積分時間・露光時間そのものとは扱いません**。少なくとも現在のWIA Propertyから、scanner camera用途で欲しい物理露光時間やLED消灯を直接制御する方法は確認できていません。
+
+この結果は64-bit開発機のWIA環境での実測です。Windows 8 x86最終環境では同じ診断を再実施します。
 
 ### 7.3 取り込み
 
@@ -455,19 +463,25 @@ WIA/TWAINともCLIではpixel単位で指定します。
 
 X方向とY方向の解像度が異なる場合も別々に換算します。
 
-## 11. 露出・LED制御の位置づけ
+## 11. WIA/TWAINで確認した露出・LED制御
 
-WIAで公開された`brightness`はfi-65F実機で画像変化を確認済みですが、物理的なCIS積分時間や露光時間そのものとは断定していません。
+scanner camera用途では、WIAとTWAINを別々に見るより、**同じ制御目的に対して両方のAPIが何を公開しているか**を比較した方が判断しやすいため、実機知見をここにまとめます。
 
-32-bit PaperStream IP fi-65Fの実機試験から、標準TWAIN Capabilityについては次の知見を得ています。
+| 制御観点 | WIA実機結果 | TWAIN / PaperStream IP実機結果 |
+|---|---|---|
+| 通常画像取得 | WIA transferで実画像取得確認 | native transferで実画像取得確認 |
+| DPI | 75～600 dpiをread/write確認 | X/Y resolutionのSET/read-back、実取得確認 |
+| brightness | -128～127をread/write、設定変更に実画像が追従 | `ICAP_BRIGHTNESS`をSET/read-backして実取得確認 |
+| contrast | -128～127をread/write確認 | `ICAP_CONTRAST`をSET/read-backして実取得確認 |
+| 物理露光時間 / 積分時間 | 対応する直接Propertyは確認できず | `ICAP_EXPOSURETIME`は非対応 |
+| 自動輝度 | scanner camera向けの直接相当Propertyは確認できず | `ICAP_AUTOBRIGHT`は対応・SET/read-back可能 |
+| ランプON/OFF | 直接ランプ制御Propertyは確認できず | `ICAP_LAMPSTATE`は非対応 |
+| 光源選択 | 直接光源選択Propertyは確認できず | `ICAP_LIGHTSOURCE`は対応し、RED/BLUE指定で実LED色も変化 |
+| LED無発光スキャン | 確認できず | `ICAP_LIGHTSOURCE=3`はreadback=3でもLED消灯せず |
 
-- `ICAP_EXPOSURETIME`: 非対応。TWAIN標準の露出時間制御は利用できない
-- `ICAP_LAMPSTATE`: 非対応。TWAIN標準のランプON/OFF制御は利用できない
-- `ICAP_AUTOBRIGHT`: 対応・SET/read-back可能
-- `ICAP_LIGHTSOURCE`: 対応・SET/read-back可能で、RED/BLUE指定では実LED色も変化
-- `ICAP_LIGHTSOURCE=3`: 値は受理されreadbackも3になるが、スキャン時のLEDは消灯しない
+WIAの`brightness`は実画像へ影響しますが、**物理露光時間やCIS積分時間の制御とはみなしません**。TWAINではWIAより一段深く光源色まで制御できましたが、`ICAP_EXPOSURETIME`と`ICAP_LAMPSTATE`は非対応で、`ICAP_LIGHTSOURCE=3`もLED停止にはなりませんでした。
 
-したがって、現時点では**標準WIA/TWAIN Capabilityだけで内蔵LEDを消灯したままスキャンする方法は確認できていません**。
+したがって、現時点では**標準WIA/TWAIN Capabilityだけで、物理露光時間を直接制御する方法および内蔵LEDを消灯したままスキャンする方法は確認できていません**。
 
 ソフトウェア側で次に探索する場合は、PaperStream IP固有/vendor Capabilityを候補とします。ただし全Capabilityの総当たり診断はDriver hangの実績があるため、1 Capability = 1子プロセス + timeout + checkpointの隔離方式で行います。
 
@@ -510,7 +524,12 @@ CIだけでは保証しない項目：
 - 実画像のS/N・色・ダイナミックレンジ
 - LED/導光系改造後の動作
 
-ただし開発機上では、Python 3.8.10 x86 + 32-bit PaperStream IP fi-65FでSource列挙、Capability SET/read-back、native transfer、JPEG保存まで実機確認済みです。Windows 8 x86最終環境での再確認は別途必要です。
+ただし開発機上では、WIAとTWAINの双方で実機確認を進めています。
+
+- **WIA**: 64-bit開発環境でfi-65F列挙、主要Propertyのread/write、変更条件に追従した実画像取得を確認
+- **TWAIN**: Python 3.8.10 x86 + 32-bit PaperStream IP fi-65FでSource列挙、Capability SET/read-back、native transfer、JPEG保存を確認
+
+Windows 8 x86最終環境でのWIA/TWAIN再確認は別途必要です。
 
 ## 14. 公開前のライセンス確認
 
