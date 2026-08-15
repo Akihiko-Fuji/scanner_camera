@@ -80,21 +80,12 @@ def test_probe_target_write_probe_is_no_change_set_and_readback(monkeypatch):
     def capability_get(selected, cap_id, method_name):
         del selected, cap_id
         if method_name == "get_capability_current":
-            return True, 7, next(reads)
-        if method_name == "get_capability":
-            return True, 7, [1.0, 1.5, 2.0], None
-        raise AssertionError(f"unexpected method: {method_name}")
-
-    # Keep the tuple shape explicit for both current reads.
-    def fixed_capability_get(selected, cap_id, method_name):
-        del selected, cap_id
-        if method_name == "get_capability_current":
             return True, 7, next(reads), None
         if method_name == "get_capability":
             return True, 7, [1.0, 1.5, 2.0], None
         raise AssertionError(f"unexpected method: {method_name}")
 
-    monkeypatch.setattr(target.tc, "capability_get", fixed_capability_get)
+    monkeypatch.setattr(target.tc, "capability_get", capability_get)
     monkeypatch.setattr(target.tc, "current_scalar", lambda value: value)
     monkeypatch.setattr(target.tc, "jsonable", lambda value: value)
     monkeypatch.setattr(target.tc, "_values_equivalent", lambda a, b, item_type: a == b)
@@ -193,5 +184,6 @@ def test_write_reports_creates_incremental_json_and_text(tmp_path):
 
     assert json_path.exists()
     assert text_path.exists()
-    assert "ICAP_EXPOSURETIME" in text_path.read_text(encoding="utf-8")
-    assert "TIMEOUT" in text_path.read_text(encoding="utf-8")
+    text = text_path.read_text(encoding="utf-8")
+    assert "ICAP_EXPOSURETIME" in text
+    assert "TIMEOUT" in text
