@@ -25,7 +25,7 @@ class FakeManager:
         self.closed = True
 
 
-def test_create_source_manager_keeps_hidden_parent_until_manager_close(monkeypatch):
+def test_create_source_manager_keeps_hidden_parent_until_close_helper(monkeypatch):
     parent = FakeParent()
     manager = FakeManager()
     captured = {}
@@ -38,20 +38,19 @@ def test_create_source_manager_keeps_hidden_parent_until_manager_close(monkeypat
 
     monkeypatch.setattr(target.twain, "SourceManager", source_manager)
 
-    session = target.create_source_manager(None)
+    returned = target.create_source_manager(None)
 
+    assert returned is manager
     assert captured["parent_window"] is parent
     assert captured["ProductName"] == "scanner_camera"
     assert parent.destroyed is False
-    assert session.source_list == []
+    assert target._TWAIN_PARENT_WINDOWS[id(manager)] is parent
 
-    session.close()
+    target.close_source_manager(manager)
 
     assert manager.closed is True
     assert parent.destroyed is True
-
-    # close is intentionally idempotent.
-    session.close()
+    assert id(manager) not in target._TWAIN_PARENT_WINDOWS
 
 
 def test_create_source_manager_forwards_explicit_dsm(monkeypatch):
@@ -67,11 +66,12 @@ def test_create_source_manager_forwards_explicit_dsm(monkeypatch):
 
     monkeypatch.setattr(target.twain, "SourceManager", source_manager)
 
-    session = target.create_source_manager(r"C:\TWAIN\TWAINDSM.dll")
+    returned = target.create_source_manager(r"C:\TWAIN\TWAINDSM.dll")
     try:
+        assert returned is manager
         assert captured["dsm_name"] == r"C:\TWAIN\TWAINDSM.dll"
     finally:
-        session.close()
+        target.close_source_manager(manager)
 
 
 def test_create_source_manager_destroys_parent_if_dsm_open_fails(monkeypatch):
@@ -90,19 +90,27 @@ def test_create_source_manager_destroys_parent_if_dsm_open_fails(monkeypatch):
     assert parent.destroyed is True
 
 
-def test_manager_session_destroys_parent_even_if_manager_close_fails():
+def test_close_source_manager_destroys_parent_even_if_manager_close_fails():
     parent = FakeParent()
 
     class BrokenManager:
         def close(self):
             raise RuntimeError("close failed")
 
-    session = target.TwainManagerSession(BrokenManager(), parent)
+    manager = BrokenManager()
+    target._TWAIN_PARENT_WINDOWS[id(manager)] = parent
 
     with pytest.raises(RuntimeError, match="close failed"):
-        session.close()
+        target.close_source_manager(manager)
 
     assert parent.destroyed is True
+    assert id(manager) not in target._TWAIN_PARENT_WINDOWS
+
+
+def test_close_source_manager_without_registered_parent_still_closes_manager():
+    manager = FakeManager()
+    target.close_source_manager(manager)
+    assert manager.closed is True
 
 
 def test_exception_text_uses_repr_for_empty_twain_error():
