@@ -80,37 +80,9 @@ class TwainTargetSupport:
     detail: Optional[str]
 
 
-class TwainManagerSession:
-    """TWAIN SourceManagerと、その親windowの寿命を一体で管理する。"""
-
-    def __init__(self, manager: Any, parent_window: Any):
-        self._manager = manager
-        self._parent_window = parent_window
-        self._closed = False
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._manager, name)
-
-    def close(self) -> None:
-        """DSMを閉じてから親windowを破棄する。複数回呼んでも安全。"""
-        if self._closed:
-            return
-        self._closed = True
-        close_error: Optional[BaseException] = None
-        try:
-            self._manager.close()
-        except Exception as exc:
-            close_error = exc
-        finally:
-            parent = self._parent_window
-            self._parent_window = None
-            if parent is not None:
-                try:
-                    parent.destroy()
-                except Exception:
-                    logging.debug("TWAIN parent window destroy failed", exc_info=True)
-        if close_error is not None:
-            raise close_error
+# create_source_manager()の既存戻り値契約を維持しつつ、DSM session中だけ
+# hidden parentを保持する。production pathは必ずclose_source_manager()で破棄する。
+_TWAIN_PARENT_WINDOWS: dict[int, Any] = {}
 
 
 def runtime_bitness() -> int:
@@ -412,7 +384,7 @@ def _create_hidden_parent_window() -> Any:
 
 
 def create_source_manager(dsm_name: Optional[str]) -> Any:
-    """有効なhidden parentを保持した状態でTWAIN Source Managerを開く。"""
+    """hidden parentを保持してTWAIN SourceManagerを開き、manager自体を返す。"""
     if twain is None:
         raise RuntimeError("pytwain is not installed")
 
@@ -433,7 +405,26 @@ def create_source_manager(dsm_name: Optional[str]) -> Any:
         except Exception:
             logging.debug("TWAIN parent destroy failed after DSM open failure", exc_info=True)
         raise
-    return TwainManagerSession(manager, parent)
+    _TWAIN_PARENT_WINDOWS[id(manager)] = parent
+    return manager
+
+
+def close_source_manager(manager: Any) -> None:
+    """DSMを閉じてから、対応するhidden parentを必ず破棄する。"""
+    parent = _TWAIN_PARENT_WINDOWS.pop(id(manager), None)
+    close_error: Optional[BaseException] = None
+    try:
+        manager.close()
+    except Exception as exc:
+        close_error = exc
+    finally:
+        if parent is not None:
+            try:
+                parent.destroy()
+            except Exception:
+                logging.debug("TWAIN parent window destroy failed", exc_info=True)
+    if close_error is not None:
+        raise close_error
 
 
 def source_names(manager: Any) -> list[str]:
@@ -447,10 +438,10 @@ def select_source(manager: Any, name_substring: Optional[str]) -> Any:
     if not names:
         bitness = runtime_bitness()
         raise RuntimeError(
-            f"DSM opened, but no {bitness}-bit TWAIN Data Source was enumerated. "
-            f"Confirm that the fi-65F TWAIN Data Source matches the {bitness}-bit "
-            f"Python process. WIA recognition alone is not sufficient. "
-            f"DSM={automatic_dsm_description()}"
+            f"No {bitness}-bit TWAIN source was found. DSM opened successfully, "
+            f"but no matching TWAIN Data Source was enumerated. Confirm that the "
+            f"fi-65F TWAIN Data Source matches the {bitness}-bit Python process. "
+            f"WIA recognition alone is not sufficient. DSM={automatic_dsm_description()}"
         )
     if name_substring:
         needle = name_substring.casefold()
@@ -478,9 +469,10 @@ def list_devices(dsm_name: Optional[str]) -> int:
         names = source_names(manager)
         if not names:
             print(
-                f"DSM opened successfully, but no {runtime_bitness()}-bit TWAIN Data Source "
-                f"was enumerated. Confirm that the fi-65F TWAIN Data Source is installed "
-                f"for this process bitness. DSM={dsm_name or automatic_dsm_description()}",
+                f"No {runtime_bitness()}-bit TWAIN source was found. DSM opened successfully, "
+                f"but no matching Data Source was enumerated. Confirm that the fi-65F TWAIN "
+                f"Data Source is installed for this process bitness. "
+                f"DSM={dsm_name or automatic_dsm_description()}",
                 file=sys.stderr,
             )
             return 1
@@ -489,7 +481,7 @@ def list_devices(dsm_name: Optional[str]) -> int:
         return 0
     finally:
         try:
-            manager.close()
+            close_source_manager(manager)
         except Exception:
             logging.debug("TWAIN manager close failed", exc_info=True)
 
@@ -580,12 +572,8 @@ def capability_report(
         support = "NOT_EXPOSED_BY_TWAIN"
     elif write_probe == "WRITE_PROBE_OK":
         support = "EXPOSED_AND_SETTABLE"
-    elif write_probe == "WRITE_PROBE_ADJUSTED":
-        support = "EXPOSED_BUT_WRITE_ADJUSTED"
-    elif write_probe == "WRITE_PROBE_FAILED":
+    elif write_probe in {"WRITE_PROBE_FAILED", "WRITE_PROBE_ADJUSTED"}:
         support = "EXPOSED_BUT_WRITE_REJECTED"
-    elif write_probe == "WRITE_PROBE_READBACK_FAILED":
-        support = "EXPOSED_SUPPORT_UNCERTAIN"
     elif cur_ok:
         support = "EXPOSED_READABLE"
     else:
@@ -650,7 +638,7 @@ def inspect_image_layout(source: Any, probe_writes: bool) -> dict[str, Any]:
     except Exception as exc:
         result["detail"] = f"get_image_layout_default: {type(exc).__name__}: {_exception_text(exc)}"
     if not probe_writes:
-        result["support"] = "EXPOSED_READABLE_NOT_PROBED"
+        result["support"] = "EXPOSED_WRITABLE_NOT_PROBED"
         return result
     try:
         frame, document_number, page_number, frame_number = current
@@ -1309,7 +1297,7 @@ def main() -> int:
                 logging.debug("TWAIN source close failed", exc_info=True)
         if manager is not None:
             try:
-                manager.close()
+                close_source_manager(manager)
             except Exception:
                 logging.debug("TWAIN manager close failed", exc_info=True)
 
