@@ -182,16 +182,22 @@ def test_build_parser_accepts_twain_specific_camera_controls():
 def test_create_source_manager_passes_identity_and_optional_dsm(monkeypatch):
     calls = []
     manager = object()
+    parent = object()
 
     def factory(**kwargs):
         calls.append(kwargs)
         return manager
 
     monkeypatch.setattr(target, "twain", SimpleNamespace(SourceManager=factory))
-    assert target.create_source_manager("C:/Windows/System32/TWAINDSM.dll") is manager
-    assert calls[0]["parent_window"] == 0
-    assert calls[0]["ProductName"] == "scanner_camera"
-    assert calls[0]["dsm_name"].endswith("TWAINDSM.dll")
+    monkeypatch.setattr(target, "_create_hidden_parent_window", lambda: parent)
+    try:
+        assert target.create_source_manager("C:/Windows/System32/TWAINDSM.dll") is manager
+        assert calls[0]["parent_window"] is parent
+        assert calls[0]["ProductName"] == "scanner_camera"
+        assert calls[0]["dsm_name"].endswith("TWAINDSM.dll")
+        assert target._TWAIN_PARENT_WINDOWS[id(manager)] is parent
+    finally:
+        target._TWAIN_PARENT_WINDOWS.pop(id(manager), None)
 
 
 def test_create_source_manager_rejects_missing_pytwain(monkeypatch):
