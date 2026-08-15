@@ -21,6 +21,13 @@ Fujitsu/Ricoh fi-65Fを、通常の原稿スキャナとしてだけでなく、
 
 > **Release Candidate**: 自動試験での品質強化は行っていますが、Windows 8 32-bit + fi-65Fでの最終実機確認前です。実機確認完了までは公開版とは扱いません。
 
+## 関連ハードウェア文書
+
+READMEはソフトウェアの導入・診断・画像取得を正本とし、ハードウェア実験と回路設計は次の文書へ分離します。
+
+- [fi-65F ハードウェア応答検証](docs/hardware_response_validation.md) — LED/導光板/CISの実機応答、光量異常、15-pin pin 2までの切り分け
+- [fi-65F LED制御回路設計](docs/hardware_led_control_design.md) — 15-pin pin 2へMOSFET回路を挿入し、初期化時ON / 本スキャン時OFFとする設計案と部品構成
+
 ## 1. 動作環境
 
 ### 1.1 最終運用ターゲット
@@ -125,6 +132,9 @@ scanner_camera/
 ├─ twain_capture.py               TWAIN診断・制御・画像取得
 ├─ tools/
 │  └─ twain_camera_caps_probe.py  fi-65F重点Capabilityの隔離診断
+├─ docs/
+│  ├─ hardware_response_validation.md  LED/導光板/CISの実機応答検証
+│  └─ hardware_led_control_design.md   pin 2 MOSFET LED制御回路設計
 ├─ config.ini                     共通設定 + TWAIN固有設定
 ├─ requirements.txt               一般開発用の実行依存
 ├─ requirements-dev.txt           一般開発用のテスト依存
@@ -483,9 +493,7 @@ WIAの`brightness`は実画像へ影響しますが、**物理露光時間やCIS
 
 したがって、現時点では**標準WIA/TWAIN Capabilityだけで、物理露光時間を直接制御する方法および内蔵LEDを消灯したままスキャンする方法は確認できていません**。
 
-ソフトウェア側で次に探索する場合は、PaperStream IP固有/vendor Capabilityを候補とします。ただし全Capabilityの総当たり診断はDriver hangの実績があるため、1 Capability = 1子プロセス + timeout + checkpointの隔離方式で行います。
-
-vendor CapabilityにもLED停止相当が存在しない場合、内蔵LED停止は導光部の遮光などハード側改造の課題として扱います。
+実機で確認したLED/導光板/CISの応答と、LEDを単純撤去できない理由は[ハードウェア応答検証](docs/hardware_response_validation.md)へ分離しています。15-pin pin 2へMOSFETを挿入する回路案と部品構成は[LED制御回路設計](docs/hardware_led_control_design.md)を参照してください。
 
 ## 12. テスト
 
