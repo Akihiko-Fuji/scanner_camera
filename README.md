@@ -109,7 +109,9 @@ TWAIN DSM              32-bit
 fi-65F Data Source     32-bit
 ```
 
-`pytwain 2.3.x`の自動DSM選択を使用する場合、32-bit Windows/TWAIN 1では通常`%WINDIR%\twain_32.dll`を使用します。64-bit Pythonでは通常`twaindsm.dll`を使用します。
+64-bit Windows上でも32-bit Pythonを使う場合は32-bit PaperStream IP (TWAIN) Data Sourceが必要です。OSのbitnessではなく、TWAINを呼び出すアプリケーション/Pythonプロセスのbitnessに合わせます。
+
+`pytwain 2.3.x`の自動DSM選択を使用する場合、32-bit Pythonでは通常`%WINDIR%\twain_32.dll`を使用します。64-bit Pythonでは通常`twaindsm.dll`を使用します。
 
 そのため、通常は`[twain] dsm_name`を空欄のままにします。DSMを明示するのは自動選択で成立しない場合だけです。
 
@@ -121,6 +123,8 @@ TWAIN診断JSONには、実行中Pythonのbitnessと、明示したDSM名また�
 scanner_camera/
 ├─ scanner_capture.py             WIA診断・制御・画像取得
 ├─ twain_capture.py               TWAIN診断・制御・画像取得
+├─ tools/
+│  └─ twain_camera_caps_probe.py  fi-65F重点Capabilityの隔離診断
 ├─ config.ini                     共通設定 + TWAIN固有設定
 ├─ requirements.txt               一般開発用の実行依存
 ├─ requirements-dev.txt           一般開発用のテスト依存
@@ -173,6 +177,26 @@ WIAで公開されない物理露光時間・積分時間・アナログゲイ�
 
 TWAINの有効Capability、型、範囲、単位はData Source依存です。fi-65F実機の診断結果を正本として判断します。
 
+PaperStream IP fi-65Fでは、全Capabilityを走査する`twain_capture.py --diagnose`が`GETDEFAULT`だけでなく`GETCURRENT`や`MSG_QUERYSUPPORT`でもDriver内部から戻らなくなる実機事象を確認しています。そのためscanner camera向けの重点確認では、次の隔離診断ツールを優先します。
+
+### 4.3 `tools/twain_camera_caps_probe.py` — 実機向け限定診断
+
+次の4 Capabilityだけを対象にします。
+
+- `ICAP_EXPOSURETIME`
+- `ICAP_AUTOBRIGHT`
+- `ICAP_LAMPSTATE`
+- `ICAP_LIGHTSOURCE`
+
+各Capabilityを別Python子プロセスで診断し、既定8秒のwall-clock timeoutを設けます。Driverが停止しても親プロセスからその子だけを終了し、次のCapabilityへ進みます。
+
+- `GETDEFAULT`は呼ばない
+- `GETCURRENT` → `GET` → `MSG_QUERYSUPPORT`の順で確認
+- `--probe-writes`時のみ現在値のno-change SET/read-backを実施
+- 各native操作の前後にcheckpointを保存
+- `diagnostics/twain_camera_caps_*.json/.txt`を逐次更新
+- cleanupだけが停止した場合も取得済み結果を維持
+
 ## 5. 出力ファイルの整合性
 
 WIA/TWAINは共通して次の保存契約を使います。
@@ -203,18 +227,23 @@ WIA/TWAINは共通して次の保存契約を使います。
 probe_writes = false
 ```
 
-したがって通常の診断はDriver/Data SourceへSETしません。
+WIAの通常診断はDriverへSETしません。
 
 ```bat
 py -3.8-32 scanner_capture.py --device fi-65F --diagnose
-py -3.8-32 twain_capture.py --device fi-65F --diagnose
+```
+
+TWAINのPaperStream IP fi-65Fでは全Capability診断がDriver内部で停止する実機事象があるため、scanner camera向けの確認には限定probeを使用します。
+
+```bat
+py -3.8-32 tools\twain_camera_caps_probe.py
 ```
 
 Sourceが安定していることを確認後、no-change write/read-back probeを明示的に行う場合だけ`--probe-writes`を付けます。
 
 ```bat
 py -3.8-32 scanner_capture.py --device fi-65F --diagnose --probe-writes
-py -3.8-32 twain_capture.py --device fi-65F --diagnose --probe-writes
+py -3.8-32 tools\twain_camera_caps_probe.py --probe-writes
 ```
 
 `--no-probe-writes`は、ローカル`config.ini`が`true`でもCLIから強制的に無効化するために残しています。`--probe-writes`と`--no-probe-writes`の同時指定は設定エラーです。
@@ -227,7 +256,7 @@ py -3.8-32 twain_capture.py --device fi-65F --diagnose --probe-writes
 py -3.8-32 scanner_capture.py --list-devices
 ```
 
-### 7.2 診断
+### 7.2 診断とfi-65F実機結果
 
 ```bat
 py -3.8-32 scanner_capture.py --device fi-65F --diagnose
@@ -240,15 +269,23 @@ py -3.8-32 scanner_capture.py --device fi-65F --diagnose
 ./diagnostics/wia_diagnostic_YYYYMMDD_HHMMSS.txt
 ```
 
-64-bit開発機でのfi-65F実測では以下を確認済みです。
+2026-08-15の64-bit開発機上のfi-65F実機診断では、read-only診断に加えて`--probe-writes`によるno-change SET/read-backを実施し、主要な公開Propertyが実際に書き戻せることを確認しました。
 
-- X/Y解像度: 75～600 dpi
-- brightness: -128～127
-- contrast: -128～127
-- threshold: 1～255
-- 24 bit RGB出力
+| WIA項目 | 実機結果 |
+|---|---|
+| X/Y解像度 | 75～600 dpi、read/write確認 |
+| brightness | -128～127、read/write確認、設定変更に実画像が追従 |
+| contrast | -128～127、read/write確認 |
+| threshold | 1～255、read/write確認 |
+| scan position / extent | 公開範囲内でread/write確認 |
+| rotation | `0`のみ公開 |
+| 画像形式 | 24 bit RGB、BMP transferを使用 |
+| orientation / mirror / invert / warm-up | 直接Propertyは非公開 |
+| 物理露光時間 / 積分時間 / analog gain / lamp intensity | 対応する直接Propertyは確認できず |
 
-これは64-bit WIA環境の実測であり、Windows 8 x86では再診断します。
+WIAの`brightness`は設定変更に対して実画像が変化することを確認していますが、これは**物理的なCIS積分時間・露光時間そのものとは扱いません**。少なくとも現在のWIA Propertyから、scanner camera用途で欲しい物理露光時間やLED消灯を直接制御する方法は確認できていません。
+
+この結果は64-bit開発機のWIA環境での実測です。Windows 8 x86最終環境では同じ診断を再実施します。
 
 ### 7.3 取り込み
 
@@ -269,28 +306,47 @@ py -3.8-32 scanner_capture.py ^
 py -3.8-32 twain_capture.py --list-devices
 ```
 
-fi-65Fが見えない場合は、Python / DSM / Data Sourceのbitnessと32-bit Data Sourceの導入状態を確認します。
+32-bit PaperStream IP導入後の実機では、次の2 Sourceが同時に列挙される場合があります。
 
-### 8.2 read-only診断
+```text
+PaperStream IP fi-65F
+WIA-fi-65F
+```
+
+この場合`--device fi-65F`は曖昧になるため、PaperStream IPを使う試験ではSource名を完全指定します。
 
 ```bat
-py -3.8-32 twain_capture.py --device fi-65F --diagnose
+--device "PaperStream IP fi-65F"
+```
+
+fi-65Fが見えない場合は、Python / DSM / Data Sourceのbitnessと32-bit Data Sourceの導入状態を確認します。
+
+### 8.2 scanner camera向けread-only診断
+
+PaperStream IP fi-65Fでは、全Capabilityを順番に照会する`twain_capture.py --diagnose`がDriver内部で停止する場合があります。実機では`GETDEFAULT`、`GETCURRENT`、`MSG_QUERYSUPPORT`で停止した例があり、Ctrl+C後の`MSG_CLOSEDS`まで停止した例もあります。
+
+このため、scanner cameraで必要な4 Capabilityは限定probeで確認します。
+
+```bat
+py -3.8-32 tools\twain_camera_caps_probe.py
 ```
 
 出力：
 
 ```text
-./diagnostics/twain_diagnostic_YYYYMMDD_HHMMSS.json
-./diagnostics/twain_diagnostic_YYYYMMDD_HHMMSS.txt
+./diagnostics/twain_camera_caps_YYYYMMDD_HHMMSS.json
+./diagnostics/twain_camera_caps_YYYYMMDD_HHMMSS.txt
 ```
 
-write probeは別段階で実施します。
+各Capabilityは別プロセスで実行され、既定8秒でtimeoutします。途中でDriverが停止してもcheckpointと部分結果を残します。
+
+write probeはread-only結果を確認した後だけ実施します。
 
 ```bat
-py -3.8-32 twain_capture.py --device fi-65F --diagnose --probe-writes
+py -3.8-32 tools\twain_camera_caps_probe.py --probe-writes
 ```
 
-### 8.3 重点Capability
+### 8.3 重点Capabilityとfi-65F実機結果
 
 基本画像設定：
 
@@ -317,13 +373,26 @@ scanner cameraで特に確認するもの：
 - `ICAP_XNATIVERESOLUTION` / `ICAP_YNATIVERESOLUTION`
 - `DAT_IMAGELAYOUT`
 
-TWAIN仕様にCapabilityが存在しても、fi-65F Data Sourceが実装しているとは限りません。
+2026-08-15の32-bit PaperStream IP fi-65F実機試験では、重点4 Capabilityについて次を確認しました。
+
+| Capability | 結果 | 実機確認内容 |
+|---|---|---|
+| `ICAP_EXPOSURETIME` | 非対応 | `query_support=0`、`GETCURRENT`/`GET`とも`CapUnsupported` |
+| `ICAP_AUTOBRIGHT` | 対応・SET可能 | `query_support=31`、current=`True`、no-change SET/read-back=`OK` |
+| `ICAP_LAMPSTATE` | 非対応 | `query_support=0`、`GETCURRENT`/`GET`とも`CapUnsupported` |
+| `ICAP_LIGHTSOURCE` | 対応・SET可能 | `query_support=31`、current=`1`、no-change SET/read-back=`OK` |
+
+`ICAP_LIGHTSOURCE`についてはraw値`0`、`1`、`2`、`3`、`4`をそれぞれSETし、**全値でrequested値とreadback値が一致した状態でnative transferとJPEG保存まで完走**しました。
+
+実機の発光観察では、RED/BLUE指定で内蔵LEDの発光色が実際に変化しました。したがって`ICAP_LIGHTSOURCE`は単なるDriver上のダミー値ではなく、fi-65Fの光源制御へ到達しています。
+
+一方、光源なしを意図した値`3`も`requested=3 readback=3`で受理され、スキャン自体も完走しましたが、**内蔵LEDは消灯しませんでした**。このため標準`ICAP_LIGHTSOURCE`だけではscanner camera用途に必要な「LED無発光スキャン」は実現できていません。
 
 ### 8.4 基本取り込み
 
 ```bat
 py -3.8-32 twain_capture.py ^
-  --device fi-65F ^
+  --device "PaperStream IP fi-65F" ^
   --dpi 600 ^
   --mode color ^
   --brightness -128 ^
@@ -332,17 +401,15 @@ py -3.8-32 twain_capture.py ^
 
 ### 8.5 TWAIN固有設定
 
-診断で公開・SET可能と確認された値だけ指定します。
+診断で公開・SET可能と確認された値だけ指定します。fi-65F実機では`ICAP_AUTOBRIGHT`と`ICAP_LIGHTSOURCE`のSET/read-backを確認済みです。
 
 ```bat
 py -3.8-32 twain_capture.py ^
-  --device fi-65F ^
-  --dpi 600 ^
-  --mode color ^
+  --device "PaperStream IP fi-65F" ^
+  --dpi 75 ^
+  --mode bw ^
   --autobright off ^
-  --exposure-time 1.0 ^
-  --gamma 1.0 ^
-  --lamp-state off
+  --light-source 0
 ```
 
 - `--autobright on|off`
@@ -351,6 +418,8 @@ py -3.8-32 twain_capture.py ^
 - `--lamp-state on|off`
 - `--light-source <raw-value>`
 - `--bit-depth <value>`
+
+fi-65F PaperStream IP実機では`ICAP_EXPOSURETIME`と`ICAP_LAMPSTATE`は非対応です。そのため`--exposure-time`や`--lamp-state`をfi-65Fの通常運用例としては使用しません。
 
 `autobright` / `lamp_state`は`on`または`off`だけを許容します。`falsee`等のタイプミスを黙ってOFFとして扱いません。
 
@@ -394,20 +463,29 @@ WIA/TWAINともCLIではpixel単位で指定します。
 
 X方向とY方向の解像度が異なる場合も別々に換算します。
 
-## 11. 露出・LED制御の位置づけ
+## 11. WIA/TWAINで確認した露出・LED制御
 
-WIAで公開された`brightness`はfi-65F実機で画像変化を確認済みですが、物理的なCIS積分時間や露光時間そのものとは断定していません。
+scanner camera用途では、WIAとTWAINを別々に見るより、**同じ制御目的に対して両方のAPIが何を公開しているか**を比較した方が判断しやすいため、実機知見をここにまとめます。
 
-TWAINでは次を追加診断します。
+| 制御観点 | WIA実機結果 | TWAIN / PaperStream IP実機結果 |
+|---|---|---|
+| 通常画像取得 | WIA transferで実画像取得確認 | native transferで実画像取得確認 |
+| DPI | 75～600 dpiをread/write確認 | X/Y resolutionのSET/read-back、実取得確認 |
+| brightness | -128～127をread/write、設定変更に実画像が追従 | `ICAP_BRIGHTNESS`をSET/read-backして実取得確認 |
+| contrast | -128～127をread/write確認 | `ICAP_CONTRAST`をSET/read-backして実取得確認 |
+| 物理露光時間 / 積分時間 | 対応する直接Propertyは確認できず | `ICAP_EXPOSURETIME`は非対応 |
+| 自動輝度 | scanner camera向けの直接相当Propertyは確認できず | `ICAP_AUTOBRIGHT`は対応・SET/read-back可能 |
+| ランプON/OFF | 直接ランプ制御Propertyは確認できず | `ICAP_LAMPSTATE`は非対応 |
+| 光源選択 | 直接光源選択Propertyは確認できず | `ICAP_LIGHTSOURCE`は対応し、RED/BLUE指定で実LED色も変化 |
+| LED無発光スキャン | 確認できず | `ICAP_LIGHTSOURCE=3`はreadback=3でもLED消灯せず |
 
-- `ICAP_AUTOBRIGHT`
-- `ICAP_EXPOSURETIME`
-- `ICAP_GAMMA`
-- `ICAP_LAMPSTATE`
-- `ICAP_LIGHTSOURCE`
-- `ICAP_LIGHTPATH`
+WIAの`brightness`は実画像へ影響しますが、**物理露光時間やCIS積分時間の制御とはみなしません**。TWAINではWIAより一段深く光源色まで制御できましたが、`ICAP_EXPOSURETIME`と`ICAP_LAMPSTATE`は非対応で、`ICAP_LIGHTSOURCE=3`もLED停止にはなりませんでした。
 
-Windows 8 x86 + 32-bit fi-65F Data Sourceでの公開状況は実機診断で判断します。`ICAP_LAMPSTATE`等が公開されない、またはSET不能なら、内蔵LED停止はハード側改造の課題として扱います。
+したがって、現時点では**標準WIA/TWAIN Capabilityだけで、物理露光時間を直接制御する方法および内蔵LEDを消灯したままスキャンする方法は確認できていません**。
+
+ソフトウェア側で次に探索する場合は、PaperStream IP固有/vendor Capabilityを候補とします。ただし全Capabilityの総当たり診断はDriver hangの実績があるため、1 Capability = 1子プロセス + timeout + checkpointの隔離方式で行います。
+
+vendor CapabilityにもLED停止相当が存在しない場合、内蔵LED停止は導光部の遮光などハード側改造の課題として扱います。
 
 ## 12. テスト
 
@@ -445,6 +523,13 @@ CIだけでは保証しない項目：
 - 露光時間・積分時間
 - 実画像のS/N・色・ダイナミックレンジ
 - LED/導光系改造後の動作
+
+ただし開発機上では、WIAとTWAINの双方で実機確認を進めています。
+
+- **WIA**: 64-bit開発環境でfi-65F列挙、主要Propertyのread/write、変更条件に追従した実画像取得を確認
+- **TWAIN**: Python 3.8.10 x86 + 32-bit PaperStream IP fi-65FでSource列挙、Capability SET/read-back、native transfer、JPEG保存を確認
+
+Windows 8 x86最終環境でのWIA/TWAIN再確認は別途必要です。
 
 ## 14. 公開前のライセンス確認
 
