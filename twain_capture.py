@@ -80,6 +80,39 @@ class TwainTargetSupport:
     detail: Optional[str]
 
 
+class TwainManagerSession:
+    """TWAIN SourceManagerと、その親windowの寿命を一体で管理する。"""
+
+    def __init__(self, manager: Any, parent_window: Any):
+        self._manager = manager
+        self._parent_window = parent_window
+        self._closed = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._manager, name)
+
+    def close(self) -> None:
+        """DSMを閉じてから親windowを破棄する。複数回呼んでも安全。"""
+        if self._closed:
+            return
+        self._closed = True
+        close_error: Optional[BaseException] = None
+        try:
+            self._manager.close()
+        except Exception as exc:
+            close_error = exc
+        finally:
+            parent = self._parent_window
+            self._parent_window = None
+            if parent is not None:
+                try:
+                    parent.destroy()
+                except Exception:
+                    logging.debug("TWAIN parent window destroy failed", exc_info=True)
+        if close_error is not None:
+            raise close_error
+
+
 def runtime_bitness() -> int:
     """実行中Pythonプロセスのbitnessを返す。"""
     return struct.calcsize("P") * 8
@@ -91,6 +124,12 @@ def automatic_dsm_description() -> str:
         windir = os.environ.get("WINDIR", "%WINDIR%")
         return f"auto:{windir}\\twain_32.dll (TWAIN 1)"
     return "auto:twaindsm.dll"
+
+
+def _exception_text(exc: BaseException) -> str:
+    """TWAIN例外のstrが空でも診断可能な文字列を返す。"""
+    text = str(exc).strip()
+    return text if text else repr(exc)
 
 
 def _const(name: str) -> Optional[int]:
@@ -343,19 +382,58 @@ def _positive_float(value: Any) -> Optional[float]:
     return result
 
 
+def _create_hidden_parent_window() -> Any:
+    """pytwainのDSM session中保持する非表示Tk parentを生成する。"""
+    try:
+        import tkinter as tk
+    except ImportError as exc:
+        raise RuntimeError(
+            "TWAIN requires tkinter to create a valid hidden parent window. "
+            "Install Python with Tcl/Tk support."
+        ) from exc
+
+    root = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.update_idletasks()
+        hwnd = int(root.winfo_id())
+        if hwnd == 0:
+            raise RuntimeError("Tk returned HWND=0")
+        logging.info("Using hidden TWAIN parent HWND=0x%X", hwnd)
+        return root
+    except Exception:
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                logging.debug("Failed to destroy unusable TWAIN parent", exc_info=True)
+        raise
+
+
 def create_source_manager(dsm_name: Optional[str]) -> Any:
-    """実行中Pythonと同じbitnessのTWAIN Source Managerを開く。"""
+    """有効なhidden parentを保持した状態でTWAIN Source Managerを開く。"""
     if twain is None:
         raise RuntimeError("pytwain is not installed")
+
+    parent = _create_hidden_parent_window()
     kwargs = {
-        "parent_window": 0,
+        "parent_window": parent,
         "ProductName": "scanner_camera",
         "ProductFamily": "scanner camera",
         "Manufacturer": "scanner_camera",
     }
     if dsm_name:
         kwargs["dsm_name"] = dsm_name
-    return twain.SourceManager(**kwargs)
+    try:
+        manager = twain.SourceManager(**kwargs)
+    except Exception:
+        try:
+            parent.destroy()
+        except Exception:
+            logging.debug("TWAIN parent destroy failed after DSM open failure", exc_info=True)
+        raise
+    return TwainManagerSession(manager, parent)
 
 
 def source_names(manager: Any) -> list[str]:
@@ -369,9 +447,10 @@ def select_source(manager: Any, name_substring: Optional[str]) -> Any:
     if not names:
         bitness = runtime_bitness()
         raise RuntimeError(
-            f"No {bitness}-bit TWAIN source was found. Confirm that the scanner "
-            f"Data Source matches the {bitness}-bit Python process and that the "
-            f"appropriate DSM is available ({automatic_dsm_description()})."
+            f"DSM opened, but no {bitness}-bit TWAIN Data Source was enumerated. "
+            f"Confirm that the fi-65F TWAIN Data Source matches the {bitness}-bit "
+            f"Python process. WIA recognition alone is not sufficient. "
+            f"DSM={automatic_dsm_description()}"
         )
     if name_substring:
         needle = name_substring.casefold()
@@ -399,8 +478,9 @@ def list_devices(dsm_name: Optional[str]) -> int:
         names = source_names(manager)
         if not names:
             print(
-                f"No {runtime_bitness()}-bit TWAIN source was found. "
-                f"DSM={dsm_name or automatic_dsm_description()}",
+                f"DSM opened successfully, but no {runtime_bitness()}-bit TWAIN Data Source "
+                f"was enumerated. Confirm that the fi-65F TWAIN Data Source is installed "
+                f"for this process bitness. DSM={dsm_name or automatic_dsm_description()}",
                 file=sys.stderr,
             )
             return 1
@@ -437,7 +517,7 @@ def capability_get(
     try:
         result = method(capability_id)
     except Exception as exc:
-        return False, None, None, f"{type(exc).__name__}: {exc}"
+        return False, None, None, f"{type(exc).__name__}: {_exception_text(exc)}"
     item_type, payload = split_capability_result(result)
     return True, item_type, payload, None
 
@@ -490,7 +570,7 @@ def capability_report(
                     probe_detail = read_error
             except Exception as exc:
                 write_probe = "WRITE_PROBE_FAILED"
-                probe_detail = f"{type(exc).__name__}: {exc}"
+                probe_detail = f"{type(exc).__name__}: {_exception_text(exc)}"
     elif probe_writes and not safe_to_probe:
         write_probe = "NOT_PROBED_NON_TARGET"
     else:
@@ -500,8 +580,12 @@ def capability_report(
         support = "NOT_EXPOSED_BY_TWAIN"
     elif write_probe == "WRITE_PROBE_OK":
         support = "EXPOSED_AND_SETTABLE"
-    elif write_probe in {"WRITE_PROBE_FAILED", "WRITE_PROBE_ADJUSTED"}:
+    elif write_probe == "WRITE_PROBE_ADJUSTED":
+        support = "EXPOSED_BUT_WRITE_ADJUSTED"
+    elif write_probe == "WRITE_PROBE_FAILED":
         support = "EXPOSED_BUT_WRITE_REJECTED"
+    elif write_probe == "WRITE_PROBE_READBACK_FAILED":
+        support = "EXPOSED_SUPPORT_UNCERTAIN"
     elif cur_ok:
         support = "EXPOSED_READABLE"
     else:
@@ -531,7 +615,7 @@ def extract_supported_capability_ids(source: Any) -> tuple[list[int], Optional[s
     try:
         result = source.get_capability(cap)
     except Exception as exc:
-        return [], f"CAP_SUPPORTEDCAPS failed: {type(exc).__name__}: {exc}"
+        return [], f"CAP_SUPPORTEDCAPS failed: {type(exc).__name__}: {_exception_text(exc)}"
     _, payload = split_capability_result(result)
     values: Any = payload
     if isinstance(payload, tuple) and len(payload) == 3:
@@ -559,14 +643,14 @@ def inspect_image_layout(source: Any, probe_writes: bool) -> dict[str, Any]:
         result["exposed"] = True
         result["current"] = jsonable(current)
     except Exception as exc:
-        result["detail"] = f"get_image_layout: {type(exc).__name__}: {exc}"
+        result["detail"] = f"get_image_layout: {type(exc).__name__}: {_exception_text(exc)}"
         return result
     try:
         result["default"] = jsonable(source.get_image_layout_default())
     except Exception as exc:
-        result["detail"] = f"get_image_layout_default: {type(exc).__name__}: {exc}"
+        result["detail"] = f"get_image_layout_default: {type(exc).__name__}: {_exception_text(exc)}"
     if not probe_writes:
-        result["support"] = "EXPOSED_WRITABLE_NOT_PROBED"
+        result["support"] = "EXPOSED_READABLE_NOT_PROBED"
         return result
     try:
         frame, document_number, page_number, frame_number = current
@@ -574,7 +658,7 @@ def inspect_image_layout(source: Any, probe_writes: bool) -> dict[str, Any]:
         result["support"] = "EXPOSED_AND_SETTABLE"
     except Exception as exc:
         result["support"] = "EXPOSED_BUT_WRITE_REJECTED"
-        result["detail"] = f"set_image_layout: {type(exc).__name__}: {exc}"
+        result["detail"] = f"set_image_layout: {type(exc).__name__}: {_exception_text(exc)}"
     return result
 
 
@@ -659,7 +743,7 @@ def write_diagnostic_report(
     try:
         identity = jsonable(source.identity)
     except Exception as exc:
-        identity = {"error": f"{type(exc).__name__}: {exc}"}
+        identity = {"error": f"{type(exc).__name__}: {_exception_text(exc)}"}
     try:
         pytwain_version = twain.version() if twain is not None else None
     except Exception:
@@ -673,6 +757,7 @@ def write_diagnostic_report(
             "python_bitness": runtime_bitness(),
             "pytwain_version": pytwain_version,
             "dsm_name": dsm_name or automatic_dsm_description(),
+            "parent_window": "hidden_tk",
             "probe_writes": probe_writes,
         },
         "source": {"name": source_name, "identity": identity},
@@ -694,6 +779,7 @@ def write_diagnostic_report(
         f"({report_data['environment']['python_bitness']}-bit)",
         f"pytwain: {pytwain_version}",
         f"DSM: {report_data['environment']['dsm_name']}",
+        "Parent window: hidden Tk",
         f"Write probes: {'enabled' if probe_writes else 'disabled'}",
         "",
         "Target setting support",
@@ -795,7 +881,7 @@ def set_capability(
     except Exception as exc:
         message = (
             f"Could not set {capability_name} to {requested!r}: "
-            f"{type(exc).__name__}: {exc}"
+            f"{type(exc).__name__}: {_exception_text(exc)}"
         )
         if strict:
             raise RuntimeError(message) from exc
@@ -912,8 +998,10 @@ def apply_scan_settings(
             document_number, page_number, frame_number = current[1:]
         except Exception as exc:
             if strict:
-                raise RuntimeError(f"Could not read TWAIN image layout: {exc}") from exc
-            logging.warning("Could not read TWAIN image layout: %s", exc)
+                raise RuntimeError(
+                    f"Could not read TWAIN image layout: {_exception_text(exc)}"
+                ) from exc
+            logging.warning("Could not read TWAIN image layout: %s", _exception_text(exc))
             return actual_dpi_x, actual_dpi_y
 
         left, top, right, bottom = [float(value) for value in frame]
@@ -943,9 +1031,9 @@ def apply_scan_settings(
         except Exception as exc:
             if strict:
                 raise RuntimeError(
-                    f"Could not set TWAIN image layout to {new_frame!r}: {exc}"
+                    f"Could not set TWAIN image layout to {new_frame!r}: {_exception_text(exc)}"
                 ) from exc
-            logging.warning("Could not set TWAIN image layout: %s", exc)
+            logging.warning("Could not set TWAIN image layout: %s", _exception_text(exc))
 
     return actual_dpi_x, actual_dpi_y
 
@@ -1080,16 +1168,16 @@ def main() -> int:
         )
         autobright = _bool_value(autobright_text)
         lamp_state = _bool_value(lamp_state_text)
-    except (ValueError, Exception) as exc:
+    except Exception as exc:
         # ConfigParser boolean errors and invalid on/off values are usage/config errors.
-        logging.error("Configuration error: %s", exc)
+        logging.error("Configuration error: %s", _exception_text(exc))
         return 2
 
     if args.list_devices:
         try:
             return list_devices(dsm_name)
         except Exception as exc:
-            logging.error("%s", exc)
+            logging.error("%s: %s", type(exc).__name__, _exception_text(exc))
             if args.verbose:
                 logging.exception("Detailed failure")
             return 1
@@ -1152,7 +1240,7 @@ def main() -> int:
         )
         strict = config_strict and not args.non_strict
     except Exception as exc:
-        logging.error("Configuration error: %s", exc)
+        logging.error("Configuration error: %s", _exception_text(exc))
         return 2
 
     if mode not in {"color", "grayscale", "bw"}:
@@ -1209,7 +1297,7 @@ def main() -> int:
         return 0
     except Exception as exc:
         remove_empty_reservation(reserved_output)
-        logging.error("%s", exc)
+        logging.error("%s: %s", type(exc).__name__, _exception_text(exc))
         if args.verbose:
             logging.exception("Detailed failure")
         return 1
