@@ -539,7 +539,13 @@ CIだけでは保証しない項目：
 
 Windows 8 x86最終環境でのWIA/TWAIN再確認は別途必要です。
 
-## 14. 公開前のライセンス確認
+## 14. 参考
+
+- [No trouble connecting to a Fujitsu fi-65f scanner, but it is unrecognized](https://www.reddit.com/r/raspberry_pi/comments/1drbb8i/no_trouble_connecting_to_a_fujitsu_fi65f_scanner/)
+- [Simple Scanner Camera](https://makezine.com/projects/simple-scanner-camera/)
+- [epjitsu firmware](https://github.com/Zaxuhe/fi-series-firmware)
+
+## 15. 公開前のライセンス確認
 
 このリポジトリを公開する前に、プロジェクト自身の`LICENSE`を決定し、使用している依存パッケージのライセンス条件との整合を確認します。
 
